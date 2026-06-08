@@ -192,6 +192,7 @@ export const encodeClaim = (reveal: Uint8Array): Buffer =>
   Buffer.concat([Buffer.from([2]), Buffer.from(reveal)]);
 export const encodeRefund = (reveal: Uint8Array): Buffer =>
   Buffer.concat([Buffer.from([3]), Buffer.from(reveal)]);
+export const encodeClose = (): Buffer => Buffer.from([4]);
 
 //
 // instruction builders (account order matches the program's expectations)
@@ -260,6 +261,21 @@ export function refundIx(
       { pubkey: locker, isSigner: false, isWritable: true },
     ],
     data: encodeRefund(reveal),
+  });
+}
+
+export function closeIx(
+  programId: PublicKey,
+  escrow: PublicKey,
+  locker: PublicKey,
+): TransactionInstruction {
+  return new TransactionInstruction({
+    programId,
+    keys: [
+      { pubkey: escrow, isSigner: false, isWritable: true },
+      { pubkey: locker, isSigner: true, isWritable: true },
+    ],
+    data: encodeClose(),
   });
 }
 

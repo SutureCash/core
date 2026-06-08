@@ -19,6 +19,7 @@ import { BanksClient, Clock, ProgramTestContext, start } from "solana-bankrun";
 import {
   bytesEqual,
   claimIx,
+  closeIx,
   combinePoints,
   combineScalars,
   decodeEscrow,
@@ -49,6 +50,9 @@ const ERR = {
   BadAccount: 5,
   FeeTooHigh: 6,
   BadWindows: 7,
+  BadPoint: 8,
+  AmountTooSmall: 9,
+  NotSettled: 10,
 };
 
 const ESCROW_SIZE = 253n; // bytes; must match Escrow::LEN in the program
@@ -524,6 +528,342 @@ describe("sol-escrow", () => {
       [setReadyIx(programId, s.escrow, mallory.publicKey)],
       [bob, mallory],
       ERR.Unauthorized,
+    );
+  });
+
+  //
+  // account-identity hardening (forged look-alike accounts)
+  //
+
+  // Copy a real escrow's bytes into a new account under a chosen owner, to forge a
+  // look-alike the settle paths might wrongly trust.
+  async function cloneEscrowAs(
+    src: PublicKey,
+    dest: PublicKey,
+    owner: PublicKey,
+  ) {
+    const a = await client.getAccount(src);
+    assert.ok(a, "source escrow must exist");
+
+    ctx.setAccount(dest, {
+      lamports: Number(a!.lamports),
+      data: a!.data,
+      owner,
+      executable: false,
+      rentEpoch: 0,
+    });
+  }
+
+  async function failsAny(ixs: TransactionInstruction[], signers: Keypair[]) {
+    const tx = txFrom(ixs, signers[0].publicKey);
+    tx.sign(...signers);
+
+    const res = await client.tryProcessTransaction(tx);
+    assert.notEqual(res.result, null, "expected the transaction to fail");
+  }
+
+  it("rejects claim on a non-program-owned account", async () => {
+    const s = makeSwap();
+    await lock(s);
+    const fake = Keypair.generate().publicKey;
+    await cloneEscrowAs(s.escrow, fake, PublicKey.default); // system-owned
+    await fails(
+      [
+        claimIx(
+          programId,
+          fake,
+          s.claimer.publicKey,
+          s.feeRecipient.publicKey,
+          s.alice.reveal,
+        ),
+      ],
+      [bob],
+      ERR.BadAccount,
+    );
+  });
+
+  it("rejects claim on a program-owned account at the wrong PDA", async () => {
+    const s = makeSwap();
+    await lock(s);
+    const fake = Keypair.generate().publicKey;
+    await cloneEscrowAs(s.escrow, fake, programId); // owned by us, but not the derived PDA
+    await fails(
+      [
+        claimIx(
+          programId,
+          fake,
+          s.claimer.publicKey,
+          s.feeRecipient.publicKey,
+          s.alice.reveal,
+        ),
+      ],
+      [bob],
+      ERR.BadAccount,
+    );
+  });
+
+  it("rejects refund on a non-program-owned account", async () => {
+    const s = makeSwap();
+    await lock(s);
+    const fake = Keypair.generate().publicKey;
+    await cloneEscrowAs(s.escrow, fake, PublicKey.default);
+    await fails(
+      [refundIx(programId, fake, bob.publicKey, s.bobShare.reveal)],
+      [bob],
+      ERR.BadAccount,
+    );
+  });
+
+  it("rejects set_ready on a non-program-owned account", async () => {
+    const s = makeSwap();
+    await lock(s);
+    const fake = Keypair.generate().publicKey;
+    await cloneEscrowAs(s.escrow, fake, PublicKey.default);
+    await fails(
+      [setReadyIx(programId, fake, bob.publicKey)],
+      [bob],
+      ERR.BadAccount,
+    );
+  });
+
+  //
+  // commitment-point validation at lock
+  //
+
+  it("rejects a lock with an off-curve claim point", async () => {
+    const offCurve = new Uint8Array(32);
+    offCurve[0] = 2; // y = 2 is not on the Ed25519 curve
+    const s = makeSwap({ claimPoint: offCurve });
+    await fails(
+      [lockIx(programId, bob.publicKey, s.escrow, s.lockArgs)],
+      [bob],
+      ERR.BadPoint,
+    );
+  });
+
+  it("rejects a lock with an off-curve refund point", async () => {
+    const offCurve = new Uint8Array(32);
+    offCurve[0] = 2;
+    const s = makeSwap({ refundPoint: offCurve });
+    await fails(
+      [lockIx(programId, bob.publicKey, s.escrow, s.lockArgs)],
+      [bob],
+      ERR.BadPoint,
+    );
+  });
+
+  it("rejects a lock that commits the identity point (trivial secret 0)", async () => {
+    const identity = new Uint8Array(32);
+    identity[0] = 1; // compressed Ed25519 identity
+    const s = makeSwap({ claimPoint: identity });
+    await fails(
+      [lockIx(programId, bob.publicKey, s.escrow, s.lockArgs)],
+      [bob],
+      ERR.BadPoint,
+    );
+  });
+
+  //
+  // amount + timelock bounds at lock
+  //
+
+  it("rejects a lock below the rent-floor amount", async () => {
+    const s = makeSwap({ amount: 1n });
+    await fails(
+      [lockIx(programId, bob.publicKey, s.escrow, s.lockArgs)],
+      [bob],
+      ERR.AmountTooSmall,
+    );
+  });
+
+  it("rejects a lock whose claim window is shorter than the minimum", async () => {
+    const s = makeSwap({ t0: T0, t1: T0 + 500n }); // 500s < 600s minimum
+    await fails(
+      [lockIx(programId, bob.publicKey, s.escrow, s.lockArgs)],
+      [bob],
+      ERR.BadWindows,
+    );
+  });
+
+  it("rejects a lock whose claim window is already in the past", async () => {
+    const s = makeSwap({ t0: NOW - 100n, t1: NOW + 1_000n });
+    await fails(
+      [lockIx(programId, bob.publicKey, s.escrow, s.lockArgs)],
+      [bob],
+      ERR.BadWindows,
+    );
+  });
+
+  //
+  // fee boundaries
+  //
+
+  it("charges no fee when fee_bps is 0", async () => {
+    const s = makeSwap({ feeBps: 0 });
+    await lock(s);
+    await ok([setReadyIx(programId, s.escrow, bob.publicKey)], [bob]);
+    await ok(
+      [
+        claimIx(
+          programId,
+          s.escrow,
+          s.claimer.publicKey,
+          s.feeRecipient.publicKey,
+          s.alice.reveal,
+        ),
+      ],
+      [bob],
+    );
+    assert.equal(await client.getBalance(s.claimer.publicKey), AMOUNT);
+    assert.equal(await client.getBalance(s.feeRecipient.publicKey), 0n);
+  });
+
+  it("allows a fee exactly at the 3% cap", async () => {
+    const s = makeSwap({ feeBps: 300 });
+    await lock(s);
+    await ok([setReadyIx(programId, s.escrow, bob.publicKey)], [bob]);
+    await ok(
+      [
+        claimIx(
+          programId,
+          s.escrow,
+          s.claimer.publicKey,
+          s.feeRecipient.publicKey,
+          s.alice.reveal,
+        ),
+      ],
+      [bob],
+    );
+    const fee = (AMOUNT * 300n) / 10_000n;
+    assert.equal(await client.getBalance(s.claimer.publicKey), AMOUNT - fee);
+    assert.equal(await client.getBalance(s.feeRecipient.publicKey), fee);
+  });
+
+  it("rejects a claim where the escrow PDA is itself a payout target", async () => {
+    // Lock with claimer set to the escrow PDA, then try to claim into it.
+    const id = randomId();
+    const [escrow] = escrowPda(programId, bob.publicKey, id);
+    const alice = randomShare();
+    const bobShare = randomShare();
+    const feeRecipient = Keypair.generate();
+    const lockArgs: LockArgs = {
+      id,
+      claimer: escrow, // pathological: pay the escrow itself
+      feeRecipient: feeRecipient.publicKey,
+      claimPoint: alice.point,
+      refundPoint: bobShare.point,
+      amount: AMOUNT,
+      feeBps: FEE_BPS,
+      t0: T0,
+      t1: T1,
+    };
+    await ok([lockIx(programId, bob.publicKey, escrow, lockArgs)], [bob]);
+    await ok([setReadyIx(programId, escrow, bob.publicKey)], [bob]);
+    await fails(
+      [
+        claimIx(
+          programId,
+          escrow,
+          escrow,
+          feeRecipient.publicKey,
+          alice.reveal,
+        ),
+      ],
+      [bob],
+      ERR.BadAccount,
+    );
+  });
+
+  //
+  // set_ready lifecycle
+  //
+
+  it("rejects set_ready after the escrow has settled", async () => {
+    const s = makeSwap();
+    await lock(s);
+    // settle via an early refund (set_ready never called yet)
+    await ok(
+      [refundIx(programId, s.escrow, bob.publicKey, s.bobShare.reveal)],
+      [bob],
+    );
+    await fails(
+      [setReadyIx(programId, s.escrow, bob.publicKey)],
+      [bob],
+      ERR.AlreadySettled,
+    );
+  });
+
+  it("rejects set_ready after t1", async () => {
+    const s = makeSwap();
+    await lock(s);
+    await setNow(T1);
+    await fails(
+      [setReadyIx(programId, s.escrow, bob.publicKey)],
+      [bob],
+      ERR.NotInClaimWindow,
+    );
+  });
+
+  //
+  // close (rent reclaim)
+  //
+
+  it("lets Bob close a settled escrow and reclaim the rent", async () => {
+    const s = makeSwap();
+    await lock(s);
+    await ok([setReadyIx(programId, s.escrow, bob.publicKey)], [bob]);
+    await ok(
+      [
+        claimIx(
+          programId,
+          s.escrow,
+          s.claimer.publicKey,
+          s.feeRecipient.publicKey,
+          s.alice.reveal,
+        ),
+      ],
+      [bob],
+    );
+    assert.equal(await client.getBalance(s.escrow), escrowRent); // rent left after payout
+    await ok([closeIx(programId, s.escrow, bob.publicKey)], [bob]);
+    assert.equal(await client.getBalance(s.escrow), 0n); // drained + reaped
+  });
+
+  it("rejects closing an escrow that hasn't settled", async () => {
+    const s = makeSwap();
+    await lock(s);
+    await fails(
+      [closeIx(programId, s.escrow, bob.publicKey)],
+      [bob],
+      ERR.NotSettled,
+    );
+  });
+
+  it("rejects close by anyone but the locker", async () => {
+    const s = makeSwap();
+    await lock(s);
+    await ok(
+      [refundIx(programId, s.escrow, bob.publicKey, s.bobShare.reveal)],
+      [bob],
+    );
+    const mallory = Keypair.generate();
+    await fails(
+      [closeIx(programId, s.escrow, mallory.publicKey)],
+      [bob, mallory],
+      ERR.Unauthorized,
+    );
+  });
+
+  //
+  // reinitialization
+  //
+
+  it("rejects re-locking the same escrow id", async () => {
+    const s = makeSwap();
+    await lock(s);
+    await failsAny(
+      [lockIx(programId, bob.publicKey, s.escrow, s.lockArgs)],
+      [bob],
     );
   });
 });

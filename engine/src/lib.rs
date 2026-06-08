@@ -268,4 +268,12 @@ mod tests {
         let monero_pubkey_half = alice.public.compress().to_bytes();
         assert_eq!(solana_claim_point, monero_pubkey_half);
     }
+
+    #[test]
+    fn the_zero_scalar_does_not_match_a_real_key_share() {
+        // 0·G is the identity, never a real share's point. The on-chain `lock` rejects
+        // an identity commitment outright, but the reveal check must fail here too.
+        let alice = KeyShare::generate();
+        assert!(!verify_reveal(&Scalar::ZERO, &alice.public));
+    }
 }

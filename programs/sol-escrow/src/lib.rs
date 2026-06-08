@@ -20,11 +20,17 @@
 //!     s_b, letting Alice recover her XMR.
 //!
 //! The windows never overlap, so at most one of claim/refund is ever valid, and the
-//! `settled` flag makes sure it happens exactly once.
+//! `settled` flag makes sure it happens exactly once. Once settled, Bob can `close`
+//! the escrow to reclaim the leftover rent.
+//!
+//! Account-identity safety: the escrow is a PDA, and every instruction re-derives
+//! that PDA and checks the account is owned by this program before trusting its
+//! contents (see `load`). The committed points are validated at `lock` so a
+//! malicious counterparty can't brick a swap with a garbage or identity point.
 
 use borsh::{BorshDeserialize, BorshSerialize};
 use solana_curve25519::{
-    edwards::{multiply_edwards, PodEdwardsPoint},
+    edwards::{multiply_edwards, validate_edwards, PodEdwardsPoint},
     scalar::PodScalar,
 };
 use solana_program::{
@@ -48,6 +54,14 @@ const ED25519_BASEPOINT: PodEdwardsPoint = PodEdwardsPoint([
     0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66,
 ]);
 
+/// Compressed Ed25519 identity point (0·G). A committed point equal to this would
+/// have the trivial discrete log 0, so it's rejected at lock.
+const ED25519_IDENTITY: [u8; 32] = {
+    let mut id = [0u8; 32];
+    id[0] = 1;
+    id
+};
+
 const ESCROW_SEED: &[u8] = b"escrow";
 
 /// The System Program address is the all-zero pubkey.
@@ -56,6 +70,10 @@ const SYSTEM_PROGRAM_ID: Pubkey = Pubkey::new_from_array([0u8; 32]);
 /// Basis points are out of 10_000. Cap the fee so a buggy or malicious offer can't
 /// swallow the whole trade.
 const MAX_FEE_BPS: u16 = 300; // 3%
+
+/// Minimum gap between the two timelocks. `unix_timestamp` is validator-estimated and
+/// can drift by tens of seconds, so a swap needs a comfortable window — not seconds.
+const MIN_WINDOW_SECS: i64 = 600; // 10 minutes
 
 #[derive(BorshSerialize, BorshDeserialize, Debug)]
 pub enum SwapInstruction {
@@ -81,6 +99,9 @@ pub enum SwapInstruction {
     /// Bob reclaims the SOL by revealing s_b inside a refund window.
     /// Accounts: [escrow PDA (writable), locker (writable)]
     Refund { reveal: [u8; 32] },
+    /// Bob reclaims the leftover rent from a settled escrow, closing the account.
+    /// Accounts: [escrow PDA (writable), locker (signer, writable)]
+    Close,
 }
 
 #[derive(BorshSerialize, BorshDeserialize, Debug, Default)]
@@ -117,6 +138,9 @@ pub enum EscrowError {
     BadAccount,
     FeeTooHigh,
     BadWindows,
+    BadPoint,
+    AmountTooSmall,
+    NotSettled,
 }
 
 impl From<EscrowError> for ProgramError {
@@ -156,9 +180,10 @@ pub fn process_instruction(
             t0,
             t1,
         ),
-        SwapInstruction::SetReady => set_ready(accounts),
-        SwapInstruction::Claim { reveal } => claim(accounts, reveal),
-        SwapInstruction::Refund { reveal } => refund(accounts, reveal),
+        SwapInstruction::SetReady => set_ready(program_id, accounts),
+        SwapInstruction::Claim { reveal } => claim(program_id, accounts, reveal),
+        SwapInstruction::Refund { reveal } => refund(program_id, accounts, reveal),
+        SwapInstruction::Close => close(program_id, accounts),
     }
 }
 
@@ -179,11 +204,24 @@ fn lock(
     if fee_bps > MAX_FEE_BPS {
         return Err(EscrowError::FeeTooHigh.into());
     }
-    
-    // t0 < t1 keeps the abort / claim / refund windows in the right order, and a
-    // claim window has to actually exist.
-    if t0 >= t1 {
+
+    // t0 < t1 keeps the windows ordered; the gap must be wide enough to absorb
+    // validator clock skew so a party can't be pushed out of its window.
+    if t0 >= t1 || t1.checked_sub(t0).unwrap_or(0) < MIN_WINDOW_SECS {
         return Err(EscrowError::BadWindows.into());
+    }
+
+    // The committed points must be real, non-identity curve points. A garbage point
+    // can never be matched by any reveal (bricking the swap), and the identity point
+    // has the trivial discrete log 0 — both let a malicious locker grief or fake a
+    // settlement. The reveal check itself multiplies the basepoint, never the stored
+    // point, so this is the only place the commitment is vetted.
+    if !validate_edwards(&PodEdwardsPoint(claim_point))
+        || !validate_edwards(&PodEdwardsPoint(refund_point))
+        || claim_point == ED25519_IDENTITY
+        || refund_point == ED25519_IDENTITY
+    {
+        return Err(EscrowError::BadPoint.into());
     }
 
     let iter = &mut accounts.iter();
@@ -198,16 +236,29 @@ fn lock(
         return Err(EscrowError::BadAccount.into());
     }
 
+    // The claim window must still be in the future, or the swap is dead on arrival.
+    if t0 < now()? {
+        return Err(EscrowError::BadWindows.into());
+    }
+
     let (expected, bump) =
         Pubkey::find_program_address(&[ESCROW_SEED, locker.key.as_ref(), &id], program_id);
     if expected != *escrow_ai.key {
         return Err(EscrowError::BadAccount.into());
     }
 
+    // The locked amount has to clear the rent floor on its own, so the claimer's
+    // payout can land in a fresh account. This blocks dust escrows that would be
+    // unclaimable (and thus a griefing vector against a counterparty's locked XMR).
+    let rent = Rent::get()?;
+    if amount < rent.minimum_balance(0) {
+        return Err(EscrowError::AmountTooSmall.into());
+    }
+
     // Create the PDA with rent + the locked amount in one shot, owned by us so we
     // can move its lamports out later without a signature.
-    let rent = Rent::get()?.minimum_balance(Escrow::LEN);
     let lamports = rent
+        .minimum_balance(Escrow::LEN)
         .checked_add(amount)
         .ok_or(ProgramError::ArithmeticOverflow)?;
     invoke_signed(
@@ -245,12 +296,12 @@ fn lock(
     Ok(())
 }
 
-fn set_ready(accounts: &[AccountInfo]) -> ProgramResult {
+fn set_ready(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     let iter = &mut accounts.iter();
     let escrow_ai = next_account_info(iter)?;
     let locker = next_account_info(iter)?;
 
-    let mut escrow = load(escrow_ai)?;
+    let mut escrow = load(program_id, escrow_ai)?;
     if escrow.settled {
         return Err(EscrowError::AlreadySettled.into());
     }
@@ -263,24 +314,24 @@ fn set_ready(accounts: &[AccountInfo]) -> ProgramResult {
     if now()? >= escrow.t1 {
         return Err(EscrowError::NotInClaimWindow.into());
     }
-    
+
     escrow.ready = true;
     store(&escrow, escrow_ai)?;
 
     Ok(())
 }
 
-fn claim(accounts: &[AccountInfo], reveal: [u8; 32]) -> ProgramResult {
+fn claim(program_id: &Pubkey, accounts: &[AccountInfo], reveal: [u8; 32]) -> ProgramResult {
     let iter = &mut accounts.iter();
     let escrow_ai = next_account_info(iter)?;
     let claimer = next_account_info(iter)?;
     let fee_recipient = next_account_info(iter)?;
 
-    let mut escrow = load(escrow_ai)?;
+    let mut escrow = load(program_id, escrow_ai)?;
     if escrow.settled {
         return Err(EscrowError::AlreadySettled.into());
     }
-    
+
     // Alice's window: open once Bob is ready or t0 has passed, closed at t1.
     let t = now()?;
     let open = escrow.ready || t >= escrow.t0;
@@ -295,9 +346,17 @@ fn claim(accounts: &[AccountInfo], reveal: [u8; 32]) -> ProgramResult {
     {
         return Err(EscrowError::BadAccount.into());
     }
+    // A payout target must not be the escrow itself, or the transfer is a no-op and
+    // the swap settles with funds frozen inside the PDA.
+    if claimer.key == escrow_ai.key || fee_recipient.key == escrow_ai.key {
+        return Err(EscrowError::BadAccount.into());
+    }
 
     let fee = (escrow.amount as u128 * escrow.fee_bps as u128 / 10_000u128) as u64;
-    let to_claimer = escrow.amount - fee; // fee <= 3% of amount, so this never underflows
+    let to_claimer = escrow
+        .amount
+        .checked_sub(fee)
+        .ok_or(ProgramError::ArithmeticOverflow)?;
 
     // Both payouts have to leave their accounts rent-exempt: the runtime rejects any
     // credit that puts an account at a non-zero balance below the rent minimum. The
@@ -318,12 +377,12 @@ fn claim(accounts: &[AccountInfo], reveal: [u8; 32]) -> ProgramResult {
     Ok(())
 }
 
-fn refund(accounts: &[AccountInfo], reveal: [u8; 32]) -> ProgramResult {
+fn refund(program_id: &Pubkey, accounts: &[AccountInfo], reveal: [u8; 32]) -> ProgramResult {
     let iter = &mut accounts.iter();
     let escrow_ai = next_account_info(iter)?;
     let locker = next_account_info(iter)?;
 
-    let mut escrow = load(escrow_ai)?;
+    let mut escrow = load(program_id, escrow_ai)?;
     if escrow.settled {
         return Err(EscrowError::AlreadySettled.into());
     }
@@ -349,6 +408,30 @@ fn refund(accounts: &[AccountInfo], reveal: [u8; 32]) -> ProgramResult {
     store(&escrow, escrow_ai)?;
 
     msg!("refunded; revealed {}", hex32(&reveal));
+
+    Ok(())
+}
+
+/// After a swap settles, the escrow PDA still holds its rent (~0.0018 SOL). Bob, who
+/// funded it, reclaims that by closing the account; the swap's revealed secret is
+/// already on-chain in the settle transaction, so nothing is lost by reaping it.
+fn close(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
+    let iter = &mut accounts.iter();
+    let escrow_ai = next_account_info(iter)?;
+    let locker = next_account_info(iter)?;
+
+    let escrow = load(program_id, escrow_ai)?;
+    if !escrow.settled {
+        return Err(EscrowError::NotSettled.into());
+    }
+    if !locker.is_signer || locker.key.to_bytes() != escrow.locker {
+        return Err(EscrowError::Unauthorized.into());
+    }
+
+    // Drain the whole balance back to Bob; the zero-lamport PDA is reaped at the end
+    // of the transaction.
+    let balance = escrow_ai.lamports();
+    move_lamports(escrow_ai, locker, balance)?;
 
     Ok(())
 }
@@ -383,8 +466,30 @@ fn move_lamports(from: &AccountInfo, to: &AccountInfo, amount: u64) -> ProgramRe
     Ok(())
 }
 
-fn load(ai: &AccountInfo) -> Result<Escrow, ProgramError> {
-    Ok(Escrow::try_from_slice(&ai.data.borrow())?)
+/// Load and authenticate an escrow account: it must be owned by this program, be the
+/// right size, and sit at the PDA derived from its own (locker, id, bump). Without
+/// these checks an attacker could hand the settle paths a look-alike account.
+fn load(program_id: &Pubkey, ai: &AccountInfo) -> Result<Escrow, ProgramError> {
+    if ai.owner != program_id {
+        return Err(EscrowError::BadAccount.into());
+    }
+    
+    if ai.data_len() != Escrow::LEN {
+        return Err(EscrowError::BadAccount.into());
+    }
+    
+    let escrow = Escrow::try_from_slice(&ai.data.borrow())?;
+    let expected = Pubkey::create_program_address(
+        &[ESCROW_SEED, &escrow.locker, &escrow.id, &[escrow.bump]],
+        program_id,
+    )
+    .map_err(|_| EscrowError::BadAccount)?;
+    
+    if expected != *ai.key {
+        return Err(EscrowError::BadAccount.into());
+    }
+    
+    Ok(escrow)
 }
 
 fn store(escrow: &Escrow, ai: &AccountInfo) -> ProgramResult {
@@ -392,7 +497,7 @@ fn store(escrow: &Escrow, ai: &AccountInfo) -> ProgramResult {
     let mut cursor = &mut data[..];
 
     escrow.serialize(&mut cursor)?;
-    
+
     Ok(())
 }
 
@@ -402,6 +507,6 @@ fn hex32(b: &[u8; 32]) -> String {
     for byte in b {
         s.push_str(&format!("{:02x}", byte));
     }
-    
+
     s
 }
