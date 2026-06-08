@@ -1,0 +1,19 @@
+[package]
+name = "sol-escrow"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/SutureCash/core"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "sol_escrow"
+
+[dependencies]
+solana-program = "2"
+# create_account lives here now that the system instructions were split out of solana-program.
+solana-system-interface = "1"
+# Edwards group ops that lower to Solana's curve25519 syscall on-chain.
+solana-curve25519 = "2"
+borsh = { version = "1", features = ["derive"] }

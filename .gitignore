@@ -1,0 +1,26 @@
+# Rust / Cargo
+/target
+**/target
+**/*.rs.bk
+
+# Solana / build artifacts
+*.so
+test-ledger/
+.anchor/
+
+# Node (TS tests + client)
+node_modules/
+dist/
+
+# Local keypairs & secrets — NEVER commit these
+*-keypair.json
+id.json
+deploy-keypair.json
+.env
+.env.*
+
+# OS / editor
+.DS_Store
+
+# Development files
+PLAN.md

@@ -1,0 +1,15 @@
+[package]
+name = "suture-engine"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/SutureCash/core"
+description = "Host-side swap engine: the Ed25519 key-share math and reveal checks the maker/taker client builds on."
+publish = false
+
+[dependencies]
+# Ed25519 group ops. The same primitives Solana's curve25519 syscall uses on-chain,
+# and the same curve Monero keys live on, so one set of math covers both sides.
+curve25519-dalek = "4"
+# OS randomness for generating key shares.
+getrandom = "0.2"

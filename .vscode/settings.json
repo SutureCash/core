@@ -1,0 +1,6 @@
+{
+  // engine/ is excluded from the Cargo workspace so `cargo build-sbf` never tries to
+  // build the host-only engine for the BPF target. These linkedProjects let
+  // rust-analyzer load it (and its examples) anyway.
+  "rust-analyzer.linkedProjects": ["./Cargo.toml", "./engine/Cargo.toml"]
+}

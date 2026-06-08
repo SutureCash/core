@@ -1,0 +1,12 @@
+# The on-chain program is the only workspace member built for BPF. The host-side
+# Rust engine lives in engine/ and is kept out of the workspace so a plain
+# `cargo test` there never pulls in the program's BPF-only dependency tree.
+[workspace]
+resolver = "2"
+members = ["programs/sol-escrow"]
+exclude = ["engine"]
+
+[profile.release]
+overflow-checks = true
+lto = "fat"
+codegen-units = 1
