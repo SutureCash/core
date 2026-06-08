@@ -10,9 +10,11 @@ This repository is the **SOL side** of the swap — the on-chain escrow program 
 host-side engine. The Monero side lives in the companion
 [`monero`](https://github.com/SutureCash/monero) repo: 2-of-2 key aggregation, shared-address
 derivation, and a `monero-wallet-rpc` lock/scan/sweep driver that's been run end-to-end on
-stagenet. The cross-chain swap state machine — the decision logic that sequences both sides lives in `engine/swap.rs` (pure, exhaustively tested). Still missing: the executor that
-wires that state machine to live chain calls, and the maker/taker daemon. So end-to-end
-protocol safety still depends on code that doesn't exist in this repo yet.
+stagenet. The cross-chain swap state machine — the decision logic that sequences both sides lives in `engine/swap.rs`, with the executor seam and a full two-party simulation in
+`engine/executor.rs` (both pure and exhaustively tested). Still missing: the daemon that
+implements that seam over live chains (Solana RPC + `monero-wallet-rpc`) and the
+maker/taker discovery on top. So end-to-end protocol safety still depends on code that
+doesn't exist in this repo yet.
 
 ## What the on-chain program enforces
 
