@@ -89,9 +89,16 @@ impl Half {
 }
 
 fn program_id() -> Pubkey {
-    // The address `cargo build-sbf` generated, same source the TS client reads.
-    let path = "target/deploy/sol_escrow-keypair.json";
-    let kp = solana_sdk::signer::keypair::read_keypair_file(path)
+    // The address `cargo build-sbf` generated (same source the TS client reads). It lives
+    // in the core repo's target/, one level up from this daemon crate — resolve it from the
+    // crate dir so the example works regardless of the current working directory.
+    let path = std::env::var("PROGRAM_KEYPAIR").unwrap_or_else(|_| {
+        format!(
+            "{}/../target/deploy/sol_escrow-keypair.json",
+            env!("CARGO_MANIFEST_DIR")
+        )
+    });
+    let kp = solana_sdk::signer::keypair::read_keypair_file(&path)
         .unwrap_or_else(|e| panic!("read program keypair {path}: {e}"));
     kp.pubkey()
 }
