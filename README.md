@@ -118,9 +118,10 @@ Monero key.
 ## Run the full cross-chain swap
 
 `npm run devnet` proves the SOL side only. The `daemon` runs a _whole_ swap — SOL on
-devnet and XMR on Monero stagenet — hands-off, driven by the engine. It needs the sibling
-`monero` repo checked out next to this one and a `monero-wallet-rpc` per party (see that
-repo's `STAGENET.md`):
+devnet and XMR on Monero stagenet — hands-off, driven by the engine. It pulls the Monero
+side (`suture-monero`) from a pinned git tag, so a clone of `core` builds everything on its
+own — no need to check out the `monero` repo alongside. The live run does need a
+`monero-wallet-rpc` per party (see that repo's `STAGENET.md`):
 
 ```bash
 cd daemon
@@ -128,9 +129,7 @@ cargo test                       # offline: the two-party swap simulation throug
 cargo run --example swap_devnet  # the real thing (needs funded devnet + stagenet wallets)
 ```
 
-`examples/swap_devnet.rs` documents the environment it expects. Because the daemon depends
-on `../monero` by path, cloning `core` alone is enough to build the program, the engine, and
-the tests, but not the daemon.
+`examples/swap_devnet.rs` documents the environment it expects.
 
 ## License
 
