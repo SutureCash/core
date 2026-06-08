@@ -38,7 +38,7 @@ use curve25519_dalek::scalar::Scalar;
 pub fn random_scalar() -> Scalar {
     let mut wide = [0u8; 64];
 
-    getrandom::getrandom(&mut wide).expect("OS RNG unavailable");
+    getrandom::fill(&mut wide).expect("OS RNG unavailable");
     
     Scalar::from_bytes_mod_order_wide(&wide)
 }
