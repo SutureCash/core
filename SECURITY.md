@@ -7,12 +7,12 @@ been independently audited and is **not** deployed to mainnet. Do not use it wit
 funds until the pre-mainnet checklist below is done.
 
 This repository is the **SOL side** of the swap — the on-chain escrow program and the
-host-side engine. The Monero side's 2-of-2 key engine lives in the companion
-[`monero`](https://github.com/SutureCash/monero) repo (key aggregation + shared-address
-derivation, offline-tested). Still missing: the on-chain Monero lock/scan/sweep (driven
-through `monero-wallet-rpc` on stagenet — see that repo's `STAGENET.md`), the cross-chain
-swap state machine, and the maker/taker daemon. So end-to-end protocol safety still
-depends on code that doesn't exist in this repo yet.
+host-side engine. The Monero side lives in the companion
+[`monero`](https://github.com/SutureCash/monero) repo: 2-of-2 key aggregation, shared-address
+derivation, and a `monero-wallet-rpc` lock/scan/sweep driver that's been run end-to-end on
+stagenet. Still missing: the cross-chain swap state machine that drives both sides together,
+and the maker/taker daemon. So end-to-end protocol safety still depends on code that doesn't
+exist in this repo yet.
 
 ## What the on-chain program enforces
 
