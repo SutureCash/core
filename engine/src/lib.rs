@@ -30,6 +30,8 @@
 //! That is the simplification the whole design leans on, and an ETH⇄XMR swap can't
 //! make it (Ethereum verifies on secp256k1, Monero on Ed25519).
 
+pub mod swap;
+
 use curve25519_dalek::edwards::EdwardsPoint;
 use curve25519_dalek::scalar::Scalar;
 
