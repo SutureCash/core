@@ -6,15 +6,28 @@ Pre-launch. The program runs on devnet and in an in-process test suite. It has *
 been independently audited and is **not** deployed to mainnet. Do not use it with real
 funds until the pre-mainnet checklist below is done.
 
-This repository is the **SOL side** of the swap — the on-chain escrow program and the
-host-side engine. The Monero side lives in the companion
+This repository holds the on-chain escrow program, the host-side engine, and the
+maker/taker daemon. The Monero side lives in the companion
 [`monero`](https://github.com/SutureCash/monero) repo: 2-of-2 key aggregation, shared-address
 derivation, and a `monero-wallet-rpc` lock/scan/sweep driver that's been run end-to-end on
-stagenet. The cross-chain swap state machine — the decision logic that sequences both sides lives in `engine/swap.rs`, with the executor seam and a full two-party simulation in
-`engine/executor.rs` (both pure and exhaustively tested). Still missing: the daemon that
-implements that seam over live chains (Solana RPC + `monero-wallet-rpc`) and the
-maker/taker discovery on top. So end-to-end protocol safety still depends on code that
-doesn't exist in this repo yet.
+stagenet. The cross-chain decision logic that sequences both sides lives in `engine/swap.rs`,
+with the executor seam in `engine/executor.rs` (both pure and exhaustively tested). The
+`daemon/` crate implements that seam over live chains — the `sol-escrow` program via Solana
+RPC (`sol.rs`) and the Monero driver via `monero-wallet-rpc` (`xmr.rs`) — and `live.rs` is
+the watcher + run loop that turns chain state into the machine's events. It is proven offline
+by a two-party simulation driven through the real watcher (happy path + abort / griefing /
+late-refund recoveries), and `examples/swap_devnet.rs` is the live runner.
+
+What that still leaves open, and why it matters for safety:
+
+- **The full swap has not yet been run hands-off on live devnet + stagenet.** The pieces are
+  tested in isolation and against an in-process simulation; the first real end-to-end run is
+  the next milestone. Until then, treat the daemon as unproven against real network timing.
+- **No crash-resume yet.** A daemon that stops mid-swap must be restarted manually; it does
+  not reconstruct the swap phase from on-chain state. The on-chain timelocks keep funds
+  recoverable in the meantime, but an operator has to act.
+- **No maker/taker discovery.** Counterparties and terms are configured by hand, so there is
+  no protection yet against malicious offers beyond the per-swap checks below.
 
 ## What the on-chain program enforces
 
@@ -39,7 +52,10 @@ Read these before trusting the protocol with anything real.
 - **An off-chain check is load-bearing.** Before Alice locks her XMR, her client _must_
   verify that the on-chain `claim_point` equals `s_a · G` — i.e. that the committed
   Solana point really is her Monero key half. The chain cannot enforce this; the client
-  must. If it's skipped, a malicious counterparty can commit a point Alice can't use.
+  must. If it's skipped, a malicious counterparty can commit a point Alice can't use. The
+  daemon enforces it: `LiveChains::lock_xmr` (`daemon/src/live.rs`) refuses to lock and
+  raises a fault if the commitment doesn't match, and there's a test that asserts this.
+  Any other client has to do the same — it's a protocol obligation, not just this one's.
 - **Second-mover griefing.** Bob can watch Alice lock her XMR and then abort (early
   refund) before `t0`. No one loses principal — Bob's refund reveals `s_b`, so Alice
   recovers her XMR — but Alice still pays the Monero transaction fees for a swap that
@@ -62,7 +78,7 @@ Read these before trusting the protocol with anything real.
       escrow — which would void the "no custodian, trust only the math" guarantee.
 - [ ] **Run `cargo audit`** against the committed `Cargo.lock` (RustSec advisory DB).
 - [ ] **Resolve the npm advisory.** There is a moderate advisory in a transitive `uuid`
-      (under `@solana/web3.js` → `jayson`). It affects **client/test tooling only**, not
+      (under `@solana/web3.js` -> `jayson`). It affects **client/test tooling only**, not
       on-chain code. Do **not** run `npm audit fix --force` — it downgrades `@solana/web3.js`
       to a broken version. Pin a fixed `uuid` via a package override instead.
 - [ ] **Fuzz / property-test** the timelock windows and the reveal check, and pin a

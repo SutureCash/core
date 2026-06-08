@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # The host-side Rust crates: the swap engine and the daemon. Both are kept out of the
+  # BPF workspace, so they're tested directly by manifest path. The daemon pulls the
+  # `suture-monero` git tag — CI has network, so that resolves fine.
+  host:
+    name: host crates (engine + daemon)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            engine
+            daemon
+      - name: engine tests
+        run: cargo test --manifest-path engine/Cargo.toml
+      - name: daemon tests
+        run: cargo test --manifest-path daemon/Cargo.toml
+
+  # The on-chain program built to BPF, then the cases bankrun suite run against it.
+  program:
+    name: program (build-sbf) + bankrun
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      # `cargo build-sbf` and its platform-tools ship with the Agave CLI. Pin a version
+      # here instead of `stable` if you want fully reproducible BPF builds.
+      - name: Cache Solana platform-tools
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/solana
+          key: solana-platform-tools-${{ runner.os }}
+      - name: Install the Solana (Agave) CLI
+        run: |
+          sh -c "$(curl -sSfL https://release.anza.xyz/stable/install)"
+          echo "$HOME/.local/share/solana/install/active_release/bin" >> "$GITHUB_PATH"
+
+      # Produces target/deploy/sol_escrow.so (+ a fresh program keypair, which is
+      # gitignored) that bankrun loads via BPF_OUT_DIR.
+      - name: Build the program (BPF)
+        working-directory: programs/sol-escrow
+        run: cargo build-sbf
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install JS deps
+        run: npm ci
+      - name: Program test suite (bankrun)
+        run: npm test

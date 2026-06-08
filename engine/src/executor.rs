@@ -7,7 +7,7 @@
 //! sits behind the [`SwapChains`] trait — the future `swapd` daemon implements it over the
 //! `sol-escrow` Solana program and the Monero `wallet.rs` driver, while the tests here
 //! implement it over an in-memory simulation of both chains. [`execute`] maps one action to
-//! one call; the daemon's loop is just: observe an event → `swap.on(event)` → `execute` each
+//! one call; the daemon's loop is just: observe an event -> `swap.on(event)` -> `execute` each
 //! action.
 //!
 //! The simulation in the tests is the real value: it runs a maker and a taker against a

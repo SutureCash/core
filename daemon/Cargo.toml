@@ -1,0 +1,38 @@
+[package]
+name = "suture-daemon"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/SutureCash/core"
+description = "The maker/taker daemon: runs the swap state machine against the live sol-escrow program and the Monero 2-of-2 wallet driver."
+publish = false
+
+[dependencies]
+# The decision logic and the executor seam this daemon implements over live chains.
+suture-engine = { path = "../engine" }
+# The Monero side: 2-of-2 key aggregation and the wallet-rpc lock/scan/sweep driver.
+# Pinned to a tagged release of the sibling repo — this is what wires the two halves
+# together. Using a git tag (not a path) means a clone of `core` alone builds the daemon,
+# and Cargo records the exact commit in Cargo.lock so the build stays reproducible.
+suture-monero = { git = "https://github.com/SutureCash/monero.git", tag = "v0.1.0" }
+
+# Ed25519 scalars/points: the same `Scalar` the engine hands back in `SweepXmr`, and the
+# point math for the load-bearing off-chain commitment check.
+curve25519-dalek = "4"
+# Monero key/address types used at the seam (Scalar bytes -> PrivateKey, shared Address).
+monero = "0.21"
+
+# Borsh, matching the on-chain program: encode instruction data, decode the escrow account.
+borsh = { version = "1", features = ["derive"] }
+# Solana key/transaction types and signing. We build and sign transactions here, then
+# ship them over plain JSON-RPC (below) rather than pulling the full solana-client tree.
+solana-sdk = "2"
+# Transaction wire format (what the RPC's sendTransaction expects, base64'd).
+bincode = "1"
+base64 = "0.22"
+
+# JSON-RPC transport for both chains' nodes (Solana RPC and monero-wallet-rpc), over the
+# same blocking HTTP client the Monero driver already uses.
+ureq = { version = "3", features = ["json"] }
+serde_json = "1"
+hex = "0.4"
