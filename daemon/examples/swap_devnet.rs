@@ -45,7 +45,7 @@ use suture_engine::swap::{Phase, Role, Swap};
 use suture_monero::wallet::WalletRpc;
 use suture_monero::{PartyShare, Shared};
 
-use suture_daemon::live::LiveChains;
+use suture_daemon::live::{AgreedTerms, LiveChains};
 use suture_daemon::sol::{Rpc, RpcSol, SwapTerms};
 use suture_daemon::xmr::{FunderWallet, XmrChain};
 
@@ -107,12 +107,24 @@ fn main() {
     let solana_rpc = env("SOLANA_RPC", "https://api.devnet.solana.com");
     let maker_xmr_rpc = env("MAKER_MONERO_RPC", "http://127.0.0.1:38083");
     let taker_xmr_rpc = env("TAKER_MONERO_RPC", "http://127.0.0.1:38084");
+    // The two parties must run separate monero-wallet-rpc instances: each serves one open
+    // wallet at a time, so sharing a socket would make one party's open_wallet/close_wallet
+    // clobber the other's — in the worst case the maker's sweep_all could drain the taker's
+    // funder wallet. Catch a misconfiguration here, before any funds move.
+    assert_ne!(
+        maker_xmr_rpc, taker_xmr_rpc,
+        "maker and taker must use separate monero-wallet-rpc instances"
+    );
     let payer_path = env("PAYER", &format!("{}/.config/solana/id.json", env("HOME", "")));
     let funder = env("FUNDER", "funder");
     let sol_amount: u64 = env("SOL_AMOUNT", &(LAMPORTS_PER_SOL / 20).to_string())
         .parse()
         .expect("SOL_AMOUNT");
     let xmr_amount: u64 = env("XMR_PICONERO", "50000000000").parse().expect("XMR_PICONERO");
+    // Encrypts the single-use watch/sweep wallet files this run creates on disk. They're
+    // throwaway and per-machine, but the sweep wallet holds the full 2-of-2 spend key, so it
+    // must not be blank. Override with WALLET_PASSWORD; otherwise use a random per-run secret.
+    let wallet_password = env("WALLET_PASSWORD", &hex::encode(random_scalar().to_bytes()));
 
     // Key halves: s_a (taker) and s_b (maker). The points are the Solana commitments.
     let alice = Half::new();
@@ -128,7 +140,13 @@ fn main() {
     let payer = solana_sdk::signer::keypair::read_keypair_file(&payer_path)
         .unwrap_or_else(|e| panic!("read payer {payer_path}: {e}"));
     let program = program_id();
-    let claimer = Keypair::new(); // Alice's SOL receiving account (fresh)
+    // Alice's SOL receiving account. NOTE (demo limitation): this keypair is ephemeral and
+    // lives only in this process's memory. If the process dies after the taker's claim is
+    // broadcast (which credits this pubkey) but before we're done, the claimed SOL is
+    // unrecoverable — the private key is gone. A production taker must persist this key to
+    // disk before broadcasting any claim, or derive it deterministically from a seed it can
+    // reconstruct on restart.
+    let claimer = Keypair::new();
     let fee_recipient = Keypair::new(); // treasury stand-in (fresh; fee > rent so a credit is fine)
 
     let now = unix_now();
@@ -199,9 +217,22 @@ fn main() {
         xmr_amount,
         payout,
         None,
+        &wallet_password,
         "maker",
     );
-    let mut maker_chains = LiveChains::new(Role::Maker, bob.spend, claim_point, refund_point, maker_sol, maker_xmr);
+    // The terms both parties agreed to off-chain. The taker's lock_xmr checks the on-chain
+    // escrow against these before committing any XMR. (`claim_point` is checked separately,
+    // against the taker's own spend half.)
+    let agreed = AgreedTerms {
+        refund_point,
+        claimer: terms.claimer.to_bytes(),
+        fee_recipient: terms.fee_recipient.to_bytes(),
+        amount: terms.amount,
+        t0,
+        t1,
+    };
+
+    let mut maker_chains = LiveChains::new(Role::Maker, bob.spend, agreed, maker_sol, maker_xmr);
 
     // The taker (Alice): locks XMR from the funder, claims the SOL.
     let taker_sol = RpcSol::new(
@@ -219,9 +250,10 @@ fn main() {
         xmr_amount,
         payout,
         Some(FunderWallet { filename: funder, password: String::new() }),
+        &wallet_password,
         "taker",
     );
-    let mut taker_chains = LiveChains::new(Role::Taker, alice.spend, claim_point, refund_point, taker_sol, taker_xmr);
+    let mut taker_chains = LiveChains::new(Role::Taker, alice.spend, agreed, taker_sol, taker_xmr);
 
     let (mut maker, maker_start) = Swap::start_maker(t0, t1, bob.spend);
     let (mut taker, _taker_start) = Swap::start_taker(t0, t1, alice.spend);
@@ -239,7 +271,13 @@ fn main() {
     // Drive both parties until the swap completes. The clock is real unix time; the long
     // wait is the maker's sweep blocking on the Monero unlock (~10 blocks).
     let poll = Duration::from_secs(15);
-    let deadline = now + 3 * 3600;
+    // The deadline must outlast the whole protocol: the claim window stays open until `t1`
+    // (now + 4h), and the maker's sweep then blocks up to UNLOCK_TRIES * UNLOCK_POLL
+    // (60 * 30s = 30 min) waiting for the 2-of-2 output to unlock. A deadline before
+    // `t1 + sweep_wait` could abort a swap that's still legitimately in flight — leaving the
+    // maker having swept XMR while the taker's claim window has expired.
+    const MAX_SWEEP_WAIT_SECS: i64 = 60 * 30; // UNLOCK_TRIES * UNLOCK_POLL in xmr.rs
+    let deadline = t1 + MAX_SWEEP_WAIT_SECS;
     loop {
         let t = unix_now();
         let before = (maker.phase(), taker.phase());

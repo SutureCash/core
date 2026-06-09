@@ -14,7 +14,7 @@ suture-engine = { path = "../engine" }
 # Pinned to a tagged release of the sibling repo — this is what wires the two halves
 # together. Using a git tag (not a path) means a clone of `core` alone builds the daemon,
 # and Cargo records the exact commit in Cargo.lock so the build stays reproducible.
-suture-monero = { git = "https://github.com/SutureCash/monero.git", tag = "v0.1.0" }
+suture-monero = { git = "https://github.com/SutureCash/monero.git", tag = "v0.1.1" }
 
 # Ed25519 scalars/points: the same `Scalar` the engine hands back in `SweepXmr`, and the
 # point math for the load-bearing off-chain commitment check.

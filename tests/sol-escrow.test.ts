@@ -29,6 +29,8 @@ import {
   loadProgramId,
   LockArgs,
   lockIx,
+  nonCanonicalPoint,
+  nonCanonicalReveal,
   pointFromScalar,
   randomId,
   randomShare,
@@ -336,6 +338,32 @@ describe("sol-escrow", () => {
     );
   });
 
+  it("rejects a claim whose reveal is the non-canonical alias s_a + L", async () => {
+    // s_a + L reduces to s_a mod L, so the curve syscall would multiply it to the SAME point
+    // and (without the canonical guard) settle, writing an XMR-unusable scalar into `revealed`.
+    // The program must reject it before the curve op.
+    const s = makeSwap();
+    await lock(s);
+    await ok([setReadyIx(programId, s.escrow, bob.publicKey)], [bob]);
+    await fails(
+      [
+        claimIx(
+          programId,
+          s.escrow,
+          s.claimer.publicKey,
+          s.feeRecipient.publicKey,
+          nonCanonicalReveal(s.alice.scalar),
+        ),
+      ],
+      [bob],
+      ERR.BadSecret,
+    );
+    // The escrow is untouched: not settled, nothing revealed.
+    const e = await readEscrow(s.escrow);
+    assert.equal(e.settled, false);
+    assert.ok(e.revealed.every((b) => b === 0));
+  });
+
   it("rejects a claim paid to the wrong recipient", async () => {
     const s = makeSwap();
     await lock(s);
@@ -466,6 +494,27 @@ describe("sol-escrow", () => {
       [bob],
       ERR.BadSecret,
     );
+  });
+
+  it("rejects a refund whose reveal is the non-canonical alias s_b + L", async () => {
+    // Same malleability as the claim case, on the refund path: s_b + L must not settle.
+    const s = makeSwap();
+    await lock(s); // refund window open (early abort)
+    await fails(
+      [
+        refundIx(
+          programId,
+          s.escrow,
+          bob.publicKey,
+          nonCanonicalReveal(s.bobShare.scalar),
+        ),
+      ],
+      [bob],
+      ERR.BadSecret,
+    );
+    const e = await readEscrow(s.escrow);
+    assert.equal(e.settled, false);
+    assert.ok(e.revealed.every((b) => b === 0));
   });
 
   //
@@ -663,12 +712,46 @@ describe("sol-escrow", () => {
     );
   });
 
+  it("rejects a lock with a non-canonically-encoded claim point", async () => {
+    // y + p decompresses to the same valid point as y (dalek reduces mod p and ignores the
+    // high bit), so it passes the on-curve check — but the canonical-encoding guard rejects
+    // the raw y >= p. This is the cheap encoding check that closes the malleable-commitment hole.
+    const s = makeSwap({ claimPoint: nonCanonicalPoint() });
+    await fails(
+      [lockIx(programId, bob.publicKey, s.escrow, s.lockArgs)],
+      [bob],
+      ERR.BadPoint,
+    );
+  });
+
+  it("rejects a lock with a non-canonically-encoded refund point", async () => {
+    const s = makeSwap({ refundPoint: nonCanonicalPoint() });
+    await fails(
+      [lockIx(programId, bob.publicKey, s.escrow, s.lockArgs)],
+      [bob],
+      ERR.BadPoint,
+    );
+  });
+
   //
   // amount + timelock bounds at lock
   //
 
   it("rejects a lock below the rent-floor amount", async () => {
     const s = makeSwap({ amount: 1n });
+    await fails(
+      [lockIx(programId, bob.publicKey, s.escrow, s.lockArgs)],
+      [bob],
+      ERR.AmountTooSmall,
+    );
+  });
+
+  it("rejects a lock where the post-fee payout dips below the rent floor", async () => {
+    // amount == the 0-byte rent floor clears the GROSS check, but at the 3% cap the claimer
+    // would receive ~0.97 * floor — below the rent-exempt minimum, so the claim would revert
+    // and push the taker out of its window. The post-fee floor must catch this at lock.
+    const floor = (await client.getRent()).minimumBalance(0n);
+    const s = makeSwap({ amount: floor, feeBps: FEE_BPS });
     await fails(
       [lockIx(programId, bob.publicKey, s.escrow, s.lockArgs)],
       [bob],

@@ -24,13 +24,42 @@ use suture_engine::executor::{execute, SwapChains};
 use suture_engine::swap::{Event, Phase, Role, Swap};
 
 /// The slice of escrow state the watcher needs. Built from the decoded on-chain account
-/// (or a simulation in tests).
+/// (or a simulation in tests). It carries the *on-chain* committed points and terms, not
+/// any locally-held copy — that's the whole point: the load-bearing check has to compare
+/// against what the maker actually wrote on Solana, not what we hoped they'd write.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EscrowView {
     pub ready: bool,
     pub settled: bool,
     /// The scalar published when the escrow settled (zero until then).
     pub revealed: [u8; 32],
+    /// `s_a·G` as committed on-chain. A reveal matching this is a claim.
+    pub claim_point: [u8; 32],
+    /// `s_b·G` as committed on-chain. A reveal matching this is a refund.
+    pub refund_point: [u8; 32],
+    /// The SOL terms the program pinned at lock — checked against the agreed terms before
+    /// the taker locks any XMR, since a maker who can lie about `claim_point` can lie about
+    /// these too.
+    pub claimer: [u8; 32],
+    pub fee_recipient: [u8; 32],
+    pub amount: u64,
+    pub t0: i64,
+    pub t1: i64,
+}
+
+/// The off-chain terms a party agreed to, mirrored so the watcher can confirm the on-chain
+/// escrow actually matches before committing XMR. Kept separate from [`crate::sol::SwapTerms`]
+/// so [`LiveChains`] stays backend-agnostic. The taker fills this in; the maker doesn't lock
+/// XMR, so it never runs the comparison.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AgreedTerms {
+    /// `s_b·G` — the maker's spend half, as both parties agreed off-chain.
+    pub refund_point: [u8; 32],
+    pub claimer: [u8; 32],
+    pub fee_recipient: [u8; 32],
+    pub amount: u64,
+    pub t0: i64,
+    pub t1: i64,
 }
 
 /// The Solana operations the executor and watcher need. The live impl is
@@ -41,8 +70,16 @@ pub trait SolBackend {
     fn set_ready(&mut self) -> Result<(), String>;
     fn claim(&mut self) -> Result<(), String>;
     fn refund(&mut self) -> Result<(), String>;
-    /// The current escrow state, or `None` if it hasn't been created yet.
+    /// The current escrow state at a reversible ("confirmed") commitment, or `None` if it
+    /// hasn't been created yet. Cheap; used for the lock/ready transitions, which are
+    /// reversible-safe.
     fn read_escrow(&mut self) -> Result<Option<EscrowView>, String>;
+    /// The escrow at a commitment a reorg can't undo ("finalized"). Used to gate the
+    /// fund-moving settle transition, which is acted on exactly once. Defaults to
+    /// [`Self::read_escrow`] for backends without a finality distinction.
+    fn read_escrow_finalized(&mut self) -> Result<Option<EscrowView>, String> {
+        self.read_escrow()
+    }
 }
 
 /// The Monero operations the executor and watcher need. The live impl is
@@ -60,10 +97,9 @@ pub struct LiveChains<S, X> {
     role: Role,
     /// This party's own spend half — `s_b` (maker) or `s_a` (taker).
     own_spend: Scalar,
-    /// `s_a · G`: the taker's half. A reveal matching this is a claim.
-    claim_point: [u8; 32],
-    /// `s_b · G`: the maker's half. A reveal matching this is a refund.
-    refund_point: [u8; 32],
+    /// The terms this party agreed to off-chain. `lock_xmr` checks the on-chain escrow
+    /// against these before committing XMR.
+    terms: AgreedTerms,
     sol: S,
     xmr: X,
 
@@ -83,16 +119,14 @@ impl<S: SolBackend, X: XmrBackend> LiveChains<S, X> {
     pub fn new(
         role: Role,
         own_spend: Scalar,
-        claim_point: [u8; 32],
-        refund_point: [u8; 32],
+        terms: AgreedTerms,
         sol: S,
         xmr: X,
     ) -> Self {
         Self {
             role,
             own_spend,
-            claim_point,
-            refund_point,
+            terms,
             sol,
             xmr,
             fault: None,
@@ -148,10 +182,40 @@ impl<S: SolBackend, X: XmrBackend> LiveChains<S, X> {
                 // `Ready` would otherwise drive the taker to attempt a claim the program
                 // has already closed off, and the recovery path keys off the settle event
                 // regardless of which earlier phases were observed.
+                //
+                // The settle drives a fund-moving sweep we run exactly once, so we don't act
+                // on the reversible "confirmed" read above — we re-read at "finalized" and
+                // act only on that. A settle seen at "confirmed" can still be orphaned by a
+                // reorg and replaced by the opposite outcome (a refund flipping to a claim,
+                // say); finalized can't. If finalization simply hasn't caught up yet, we skip
+                // this poll and retry — `seen_settled` is only latched once we emit a real
+                // event.
+                //
+                // We classify against the points the escrow actually committed on-chain, not
+                // a local copy. If a settled escrow reports a reveal matching neither
+                // committed point, that's a lying/garbage read or a genuine disagreement —
+                // fault and let the next poll retry rather than dead-end the state machine
+                // with `seen_settled` set and no event ever emitted.
                 if !self.seen_settled {
-                    self.seen_settled = true;
-                    if let Some(event) = self.settle_event(&escrow.revealed) {
-                        events.push(event);
+                    match self.sol.read_escrow_finalized() {
+                        Ok(Some(final_escrow)) if final_escrow.settled => {
+                            match self.settle_event(&final_escrow) {
+                                Some(event) => {
+                                    self.seen_settled = true;
+                                    events.push(event);
+                                }
+                                None => self.fail(
+                                    "settle",
+                                    "escrow settled but the revealed scalar matches neither \
+                                     committed point"
+                                        .into(),
+                                ),
+                            }
+                        }
+                        // Finalization hasn't caught up to the confirmed settle yet, or the
+                        // read failed transiently — retry on the next poll.
+                        Ok(_) => {}
+                        Err(_) => {}
                     }
                 }
             } else {
@@ -177,19 +241,43 @@ impl<S: SolBackend, X: XmrBackend> LiveChains<S, X> {
         events
     }
 
-    /// Classify a revealed scalar: a reveal whose point is `claim_point` came from a claim
-    /// (it's `s_a`); one matching `refund_point` came from a refund (`s_b`).
-    fn settle_event(&self, revealed: &[u8; 32]) -> Option<Event> {
-        let ct = Scalar::from_canonical_bytes(*revealed);
+    /// Compare the on-chain escrow against the terms this party agreed to off-chain. Returns
+    /// `Some(field)` naming the first field that disagrees, or `None` if everything lines up.
+    /// (`claim_point` is checked separately in `lock_xmr` against our own spend half.)
+    fn terms_mismatch(&self, escrow: &EscrowView) -> Option<&'static str> {
+        let t = &self.terms;
+        if escrow.refund_point != t.refund_point {
+            Some("refund_point")
+        } else if escrow.claimer != t.claimer {
+            Some("claimer")
+        } else if escrow.fee_recipient != t.fee_recipient {
+            Some("fee_recipient")
+        } else if escrow.amount != t.amount {
+            Some("amount")
+        } else if escrow.t0 != t.t0 {
+            Some("t0")
+        } else if escrow.t1 != t.t1 {
+            Some("t1")
+        } else {
+            None
+        }
+    }
+
+    /// Classify a revealed scalar against the escrow's *on-chain* committed points: a reveal
+    /// whose point is the on-chain `claim_point` came from a claim (it's `s_a`); one matching
+    /// the on-chain `refund_point` came from a refund (`s_b`). Returns `None` for a
+    /// non-canonical or unrecognized reveal so the caller can fault rather than latch.
+    fn settle_event(&self, escrow: &EscrowView) -> Option<Event> {
+        let ct = Scalar::from_canonical_bytes(escrow.revealed);
         if !bool::from(ct.is_some()) {
             return None;
         }
 
         let scalar = ct.unwrap();
         let point = EdwardsPoint::mul_base(&scalar).compress().to_bytes();
-        if point == self.claim_point {
+        if point == escrow.claim_point {
             Some(Event::SolClaimed { s_a: scalar })
-        } else if point == self.refund_point {
+        } else if point == escrow.refund_point {
             Some(Event::SolRefunded { s_b: scalar })
         } else {
             None
@@ -211,17 +299,49 @@ impl<S: SolBackend, X: XmrBackend> SwapChains for LiveChains<S, X> {
     }
 
     fn lock_xmr(&mut self) {
-        // The load-bearing off-chain check: never lock XMR unless the point committed on
-        // Solana is our own spend half. Otherwise a malicious maker could commit a point we
-        // can't settle against and strand the XMR.
-        if !commit_matches(&self.own_spend, &self.claim_point) {
+        // Only the taker ever locks XMR. The maker has no funder wallet, so its `LockXmr`
+        // would fail at the wallet anyway — but its `own_spend` is `s_b`, which never equals
+        // the taker's `claim_point` (`s_a·G`), so running the commit check here would fault
+        // with a misleading "claim_point mismatch" instead of the honest "no funder". Skip
+        // the check for the maker; the taker is the one whose XMR is at risk.
+        if self.role == Role::Maker {
+            if let Err(e) = self.xmr.lock() {
+                self.fail("lock_xmr", e);
+            }
+            return;
+        }
+
+        // The load-bearing off-chain check (SECURITY.md): never lock XMR until we've read the
+        // escrow *fresh from chain* and confirmed (a) the committed `claim_point` is our own
+        // spend half — otherwise a malicious maker commits a point we can never settle against
+        // and strands the XMR — and (b) the rest of the on-chain terms match what we agreed.
+        // A maker who can lie about `claim_point` can lie about `amount`/`t0`/`t1`/`claimer`
+        // too, so all of them are checked against the value actually on Solana.
+        let escrow = match self.sol.read_escrow() {
+            Ok(Some(e)) => e,
+            Ok(None) => {
+                self.fail("lock_xmr", "escrow account does not exist yet — refusing to lock".into());
+                return;
+            }
+            Err(e) => {
+                self.fail("lock_xmr", format!("could not read escrow before locking: {e}"));
+                return;
+            }
+        };
+
+        if !commit_matches(&self.own_spend, &escrow.claim_point) {
             self.fail(
                 "lock_xmr",
-                "committed claim_point does not equal s_a·G — refusing to lock".into(),
+                "on-chain claim_point does not equal s_a·G — refusing to lock".into(),
             );
             return;
         }
-        
+
+        if let Some(mismatch) = self.terms_mismatch(&escrow) {
+            self.fail("lock_xmr", format!("on-chain terms disagree with the agreed swap: {mismatch}"));
+            return;
+        }
+
         if let Err(e) = self.xmr.lock() {
             self.fail("lock_xmr", e);
         }
@@ -305,14 +425,29 @@ impl SolBackend for crate::sol::RpcSol {
     }
     fn read_escrow(&mut self) -> Result<Option<EscrowView>, String> {
         crate::sol::RpcSol::read_escrow(self)
-            .map(|opt| {
-                opt.map(|e| EscrowView {
-                    ready: e.ready,
-                    settled: e.settled,
-                    revealed: e.revealed,
-                })
-            })
+            .map(|opt| opt.map(escrow_view))
             .map_err(|e| e.to_string())
+    }
+    fn read_escrow_finalized(&mut self) -> Result<Option<EscrowView>, String> {
+        crate::sol::RpcSol::read_escrow_finalized(self)
+            .map(|opt| opt.map(escrow_view))
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// Project the decoded on-chain [`crate::sol::Escrow`] onto the watcher's [`EscrowView`].
+fn escrow_view(e: crate::sol::Escrow) -> EscrowView {
+    EscrowView {
+        ready: e.ready,
+        settled: e.settled,
+        revealed: e.revealed,
+        claim_point: e.claim_point,
+        refund_point: e.refund_point,
+        claimer: e.claimer,
+        fee_recipient: e.fee_recipient,
+        amount: e.amount,
+        t0: e.t0,
+        t1: e.t1,
     }
 }
 
@@ -347,7 +482,22 @@ mod tests {
         ready: bool,
         settled: bool,
         revealed: [u8; 32],
+        /// The points and terms as committed *on-chain*. The watcher reads these via
+        /// `read_escrow`; tests can set `claim_point` to something other than `s_a·G` to
+        /// model a lying maker.
+        claim_point: [u8; 32],
+        refund_point: [u8; 32],
+        claimer: [u8; 32],
+        fee_recipient: [u8; 32],
+        amount: u64,
+        t0: i64,
+        t1: i64,
         xmr_locked: bool,
+        /// Total balance covers `amount` (output seen, possibly 0-conf).
+        xmr_locked_total: bool,
+        /// Unlocked balance covers `amount` (output confirmed/spendable). `locked()` gates
+        /// on this, so a 0-conf output (`xmr_locked_total` true, this false) is not "locked".
+        xmr_unlocked: bool,
         xmr_swept: bool,
         now: i64,
         s_a: Scalar,
@@ -357,17 +507,41 @@ mod tests {
     type Shared = Rc<RefCell<World>>;
 
     fn world(s_a: Scalar, s_b: Scalar) -> Shared {
+        let claim_point = EdwardsPoint::mul_base(&s_a).compress().to_bytes();
+        let refund_point = EdwardsPoint::mul_base(&s_b).compress().to_bytes();
         Rc::new(RefCell::new(World {
             exists: false,
             ready: false,
             settled: false,
             revealed: [0u8; 32],
+            claim_point,
+            refund_point,
+            claimer: [1u8; 32],
+            fee_recipient: [2u8; 32],
+            amount: 50_000_000,
+            t0: T0,
+            t1: T1,
             xmr_locked: false,
+            xmr_locked_total: true,
+            xmr_unlocked: true,
             xmr_swept: false,
             now: 0,
             s_a,
             s_b,
         }))
+    }
+
+    /// The agreed terms matching `world`'s honest defaults, for constructing `LiveChains`.
+    fn agreed(w: &Shared) -> AgreedTerms {
+        let wb = w.borrow();
+        AgreedTerms {
+            refund_point: EdwardsPoint::mul_base(&wb.s_b).compress().to_bytes(),
+            claimer: wb.claimer,
+            fee_recipient: wb.fee_recipient,
+            amount: wb.amount,
+            t0: wb.t0,
+            t1: wb.t1,
+        }
     }
 
     struct SimSol {
@@ -433,6 +607,13 @@ mod tests {
                 ready: w.ready,
                 settled: w.settled,
                 revealed: w.revealed,
+                claim_point: w.claim_point,
+                refund_point: w.refund_point,
+                claimer: w.claimer,
+                fee_recipient: w.fee_recipient,
+                amount: w.amount,
+                t0: w.t0,
+                t1: w.t1,
             }))
         }
     }
@@ -455,7 +636,10 @@ mod tests {
                 return Ok(false);
             }
 
-            Ok(self.w.borrow().xmr_locked)
+            // Mirrors the live `locked()`: the output counts as locked only once it's
+            // confirmed (unlocked balance covers the amount), not on a 0-conf total.
+            let w = self.w.borrow();
+            Ok(w.xmr_locked && w.xmr_locked_total && w.xmr_unlocked)
         }
         fn sweep(&mut self, spend_key: Scalar) -> Result<(), String> {
             let mut w = self.w.borrow_mut();
@@ -478,14 +662,10 @@ mod tests {
     }
 
     fn chains(role: Role, own: Scalar, w: &Shared, reveal: Scalar, blind: bool) -> LiveChains<SimSol, SimXmr> {
-        let claim_point = EdwardsPoint::mul_base(&w.borrow().s_a).compress().to_bytes();
-        let refund_point = EdwardsPoint::mul_base(&w.borrow().s_b).compress().to_bytes();
-        
         LiveChains::new(
             role,
             own,
-            claim_point,
-            refund_point,
+            agreed(w),
             SimSol { w: w.clone(), reveal: reveal.to_bytes() },
             SimXmr { w: w.clone(), blind },
         )
@@ -656,20 +836,125 @@ mod tests {
 
     #[test]
     fn refusing_to_lock_xmr_on_a_mismatched_commitment_is_a_fault() {
-        // If the on-chain claim_point isn't the taker's s_a·G, lock_xmr must refuse.
+        // A lying maker commits a claim_point that isn't the taker's s_a·G. The taker's
+        // LiveChains holds the *expected* terms, but the load-bearing check reads the escrow
+        // fresh, so the on-chain mismatch must fault — not the constructor value.
         let (s_a, s_b) = keys();
         let w = world(s_a, s_b);
-        let mut tc = LiveChains::new(
-            Role::Taker,
-            s_a,
-            EdwardsPoint::mul_base(&Scalar::from(999u64)).compress().to_bytes(), // wrong claim_point
-            EdwardsPoint::mul_base(&s_b).compress().to_bytes(),
-            SimSol { w: w.clone(), reveal: s_a.to_bytes() },
-            SimXmr { w: w.clone(), blind: false },
-        );
+        {
+            let mut wb = w.borrow_mut();
+            wb.exists = true;
+            wb.claim_point = EdwardsPoint::mul_base(&Scalar::from(999u64)).compress().to_bytes();
+        }
+        let mut tc = chains(Role::Taker, s_a, &w, s_a, false);
 
         execute(Action::LockXmr, &mut tc);
         assert!(tc.take_fault().is_some(), "a mismatched commitment must fault, not lock");
         assert!(!w.borrow().xmr_locked, "no XMR locked against a bad commitment");
+    }
+
+    #[test]
+    fn refusing_to_lock_xmr_when_on_chain_terms_disagree_is_a_fault() {
+        // The maker commits the right claim_point but a different amount than agreed; the
+        // taker must refuse, since a maker who can lie about one term can lie about any.
+        let (s_a, s_b) = keys();
+        let w = world(s_a, s_b);
+        // Build the taker against the honest agreed terms first, then have the on-chain
+        // escrow disagree (a maker who committed a different amount than was agreed).
+        let mut tc = chains(Role::Taker, s_a, &w, s_a, false);
+        {
+            let mut wb = w.borrow_mut();
+            wb.exists = true;
+            wb.amount += 1; // on-chain amount now disagrees with the agreed terms
+        }
+
+        execute(Action::LockXmr, &mut tc);
+        let fault = tc.take_fault();
+        assert!(fault.is_some(), "disagreeing on-chain terms must fault");
+        assert!(fault.unwrap().contains("amount"), "the fault should name the bad field");
+        assert!(!w.borrow().xmr_locked, "no XMR locked against disagreeing terms");
+    }
+
+    #[test]
+    fn maker_lock_xmr_skips_the_commit_check_and_surfaces_the_no_funder_error() {
+        // The maker never locks XMR (no funder). lock_xmr must not run the taker's
+        // commit check — own_spend is s_b, which never equals the on-chain claim_point
+        // (s_a·G) — so it should reach the wallet's honest "nothing to lock" path. Here the
+        // SimXmr lock is infallible, so we only assert it does not fault on a claim_point
+        // comparison that would otherwise (mis)fire for the maker.
+        let (s_a, s_b) = keys();
+        let w = world(s_a, s_b);
+        w.borrow_mut().exists = true;
+        let mut mc = chains(Role::Maker, s_b, &w, s_b, false);
+
+        execute(Action::LockXmr, &mut mc);
+        assert!(
+            mc.take_fault().is_none(),
+            "the maker must not fault on a claim_point mismatch it was never meant to check"
+        );
+    }
+
+    #[test]
+    fn settle_event_faults_on_a_garbage_reveal_and_does_not_latch() {
+        // A settled escrow whose reveal matches neither committed point (a lying/garbage
+        // read) must fault and leave seen_settled unlatched, so a later good read is retried
+        // rather than being dead-ended.
+        let (s_a, s_b) = keys();
+        let w = world(s_a, s_b);
+        {
+            let mut wb = w.borrow_mut();
+            wb.exists = true;
+            wb.settled = true;
+            wb.revealed = Scalar::from(424242u64).to_bytes(); // not s_a, not s_b
+        }
+        let mut tc = chains(Role::Taker, s_a, &w, s_a, false);
+
+        let events = tc.poll(0);
+        assert!(tc.take_fault().is_some(), "a garbage reveal on a settled escrow must fault");
+        assert!(
+            !events.iter().any(|e| matches!(e, Event::SolClaimed { .. } | Event::SolRefunded { .. })),
+            "no settle event for an unrecognized reveal"
+        );
+
+        // The next poll, now with the real reveal, must classify it — seen_settled was not
+        // latched.
+        w.borrow_mut().revealed = s_a.to_bytes();
+        let events = tc.poll(0);
+        assert!(tc.take_fault().is_none(), "a good reveal on retry must not fault");
+        assert!(
+            events.iter().any(|e| matches!(e, Event::SolClaimed { .. })),
+            "the real claim reveal is classified on retry"
+        );
+    }
+
+    #[test]
+    fn locked_respects_unlocked_balance_not_just_total() {
+        // The maker must arm set_ready only against confirmed XMR. A 0-conf output (total
+        // balance covers the amount, but unlocked does not) is not "locked".
+        let (s_a, s_b) = keys();
+        let w = world(s_a, s_b);
+        w.borrow_mut().exists = true;
+        let mut tc = chains(Role::Taker, s_a, &w, s_a, false);
+
+        // Output present but only 0-conf: total covers it, unlocked does not.
+        {
+            let mut wb = w.borrow_mut();
+            wb.xmr_locked = true;
+            wb.xmr_locked_total = true;
+            wb.xmr_unlocked = false;
+        }
+        let events = tc.poll(0);
+        assert!(
+            !events.iter().any(|e| matches!(e, Event::XmrLocked)),
+            "a 0-conf output must not count as locked"
+        );
+
+        // Once it confirms (unlocked covers the amount), it counts.
+        w.borrow_mut().xmr_unlocked = true;
+        let events = tc.poll(0);
+        assert!(
+            events.iter().any(|e| matches!(e, Event::XmrLocked)),
+            "a confirmed output counts as locked"
+        );
     }
 }

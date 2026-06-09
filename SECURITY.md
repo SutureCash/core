@@ -35,7 +35,12 @@ What that still leaves open, and why it matters for safety:
   the escrow account is owned by the program, is exactly the expected size, and sits at
   the PDA re-derived from its own `(locker, id, bump)`. A look-alike account is rejected.
 - **Commitment points.** At `lock`, both committed points are checked to be on the
-  Ed25519 curve and not the identity point (which would have the trivial secret `0`).
+  Ed25519 curve, canonically encoded (`y < p`), and not the identity point (which would
+  have the trivial secret `0`). Prime-order subgroup membership is _not_ verified on-chain
+  (see the limitation below).
+- **Reveal canonicality.** A revealed scalar is rejected unless it is canonical (`< L`)
+  _before_ the curve op, so the on-chain syscall's mod-L reduction can't let a malleable
+  alias (`s`, `s + L`, ...) settle and store an unusable Monero key half.
 - **One settlement.** The two timelock windows are disjoint — at most one of claim/refund
   is valid at any instant — and a `settled` flag makes it fire exactly once.
 - **Bounded fee.** The routing fee is capped at 3% (300 bps) and is computed with a
@@ -62,9 +67,12 @@ Read these before trusting the protocol with anything real.
   never completed. This is inherent to atomic swaps where one side commits first on the
   costlier chain. Mitigations: the taker waits for `set_ready` (or locks close to `t0`)
   before committing XMR; a maker bond can be added later.
-- **Non-canonical point encodings.** The on-chain curve check accepts non-canonical (but
-  on-curve) encodings. A non-canonical commitment can only brick its _own_ swap (a
-  griefing/DoS, never theft), and it's caught by the off-chain canonical check above.
+- **Prime-order subgroup membership is unverified.** The on-chain check confirms a committed
+  point is on-curve, canonically encoded, and non-identity, but it cannot cheaply prove the
+  point lies in the prime-order subgroup (there is no syscall for it). A torsion or otherwise
+  non-prime-order committed point can only brick its _own_ swap — no scalar `s·G` ever equals
+  it, so its reveal can never settle (a griefing/DoS, never theft) — and it is caught by the
+  taker's off-chain `claim_point == s_a·G` check before any XMR is locked.
 - **Timelocks use the validator clock.** `unix_timestamp` is validator-estimated and can
   drift. The program enforces a 10-minute minimum window, but clients should still set
   generous margins so neither side is pushed out of its window by skew.
@@ -83,6 +91,13 @@ Read these before trusting the protocol with anything real.
       to a broken version. Pin a fixed `uuid` via a package override instead.
 - [ ] **Fuzz / property-test** the timelock windows and the reveal check, and pin a
       reproducible build of the program.
+- [ ] **Bind the reveal to the settler's signature** (recommended hardening). `claim` and
+      `refund` authorize by reveal-knowledge alone and do not require `claimer`/`locker` to
+      sign. An on-chain observer who extracts a pending reveal from the mempool can front-run
+      the settler with their own transaction — funds still go to the committed party, but the
+      secret is published at an attacker-chosen moment, widening the front-run surface. Adding
+      `claimer.is_signer` / `locker.is_signer` removes it. Deferred because it is an invasive
+      cross-layer change (program + TS bindings + daemon settle paths) that must land together.
 
 ## Trust model
 

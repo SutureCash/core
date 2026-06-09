@@ -35,6 +35,7 @@ pub mod swap;
 
 use curve25519_dalek::edwards::EdwardsPoint;
 use curve25519_dalek::scalar::Scalar;
+use curve25519_dalek::traits::IsIdentity;
 
 /// A uniformly random Ed25519 scalar from OS entropy. Reduces 64 bytes mod the group
 /// order, which is the usual way to avoid the bias you'd get from a bare 32-byte mod.
@@ -113,12 +114,23 @@ pub struct SolEscrow {
 }
 
 impl SolEscrow {
+    /// # Identity lock points
+    ///
+    /// The deployed `sol-escrow` program rejects an identity commitment at lock time (a
+    /// `claim_point` of the identity would be "opened" by the zero scalar, which is never a
+    /// real key share). This model mirrors that guard with a `debug_assert!` so test and
+    /// debug builds catch a caller that commits the identity, without changing the
+    /// constructor's signature for release builds.
     pub fn lock(
         lock_point_claim: EdwardsPoint,
         lock_point_refund: EdwardsPoint,
         amount_lamports: u64,
         t_refund: u64,
     ) -> Self {
+        debug_assert!(
+            !lock_point_claim.is_identity() && !lock_point_refund.is_identity(),
+            "identity lock point — the on-chain program rejects this commitment",
+        );
         Self {
             lock_point_claim,
             lock_point_refund,
@@ -278,5 +290,32 @@ mod tests {
         // an identity commitment outright, but the reveal check must fail here too.
         let alice = KeyShare::generate();
         assert!(!verify_reveal(&Scalar::ZERO, &alice.public));
+    }
+
+    #[test]
+    fn verify_reveal_against_an_identity_lock_point() {
+        // If the lock point were the identity, only the zero scalar would "open" it — which
+        // is exactly why the program forbids committing the identity. A real (non-zero)
+        // scalar must not verify against it. (0·G is the identity point.)
+        let identity = EdwardsPoint::mul_base(&Scalar::ZERO);
+        assert!(!verify_reveal(&random_scalar(), &identity));
+        assert!(verify_reveal(&Scalar::ZERO, &identity));
+    }
+
+    #[test]
+    #[should_panic(expected = "identity lock point")]
+    fn lock_rejects_an_identity_claim_point() {
+        // Mirrors the on-chain guard: committing the identity is caught in debug/test builds.
+        let bob = KeyShare::generate();
+        let identity = EdwardsPoint::mul_base(&Scalar::ZERO);
+        let _ = SolEscrow::lock(identity, bob.public, 5_000_000_000, 1000);
+    }
+
+    #[test]
+    #[should_panic(expected = "identity lock point")]
+    fn lock_rejects_an_identity_refund_point() {
+        let alice = KeyShare::generate();
+        let identity = EdwardsPoint::mul_base(&Scalar::ZERO);
+        let _ = SolEscrow::lock(alice.public, identity, 5_000_000_000, 1000);
     }
 }

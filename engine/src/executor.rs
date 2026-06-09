@@ -75,6 +75,11 @@ mod tests {
         t1: i64,
         s_a: Scalar, // taker's spend half
         s_b: Scalar, // maker's spend half
+        /// The points committed in the escrow: `s_a·G` (claim) and `s_b·G` (refund). The
+        /// settle methods check the revealed scalar against these, the same on-curve check
+        /// the real escrow's `reveal_matches` performs, so a wrong reveal can't settle here.
+        lock_point_claim: EdwardsPoint,
+        lock_point_refund: EdwardsPoint,
         now: i64,
         actor: Party, // who is currently acting (set before driving a party)
 
@@ -95,6 +100,8 @@ mod tests {
                 t1: T1,
                 s_a,
                 s_b,
+                lock_point_claim: EdwardsPoint::mul_base(&s_a),
+                lock_point_refund: EdwardsPoint::mul_base(&s_b),
                 now: 0,
                 actor: Party::Maker,
                 sol_locked: false,
@@ -143,6 +150,14 @@ mod tests {
                 (self.ready || self.now >= self.t0) && self.now < self.t1,
                 "claim outside the window",
             );
+            // Mirror the escrow's reveal check: the scalar the claim publishes must open the
+            // committed claim point. The sim hardcodes s_a, so this also catches the keys
+            // having been wired up inconsistently.
+            assert_eq!(
+                EdwardsPoint::mul_base(&self.s_a),
+                self.lock_point_claim,
+                "claim reveal doesn't open the committed claim point",
+            );
             self.sol_settled = true;
             self.sol_revealed = Some(self.s_a); // claiming publishes s_a
             self.sol_to = Some(Party::Taker);
@@ -153,6 +168,12 @@ mod tests {
             assert!(
                 (self.now < self.t0 && !self.ready) || self.now >= self.t1,
                 "refund outside the window",
+            );
+            // Same reveal check on the refund path: s_b must open the committed refund point.
+            assert_eq!(
+                EdwardsPoint::mul_base(&self.s_b),
+                self.lock_point_refund,
+                "refund reveal doesn't open the committed refund point",
             );
             self.sol_settled = true;
             self.sol_revealed = Some(self.s_b); // refunding publishes s_b
@@ -280,5 +301,109 @@ mod tests {
         w.drive(Party::Taker, &mut taker, Event::SolRefunded { s_b: s_b_rev });
         w.drive(Party::Taker, &mut taker, Event::XmrSwept);
         assert_eq!(w.xmr_swept_by, Some(Party::Taker), "taker recovered the XMR after t1");
+    }
+
+    #[test]
+    fn maker_still_sweeps_when_taker_claims_late_and_solclaimed_lands_in_settled() {
+        // End-to-end of the Critical bug #1 interleaving against the faithful sim: the taker
+        // claims near the end of the window, but the maker hasn't observed it and its own t1
+        // timer fires first. The maker's refund can't land (escrow already claimed); the real
+        // SolClaimed then arrives while the maker is in Settled. The maker must still sweep
+        // the XMR and end made whole — not strand its principal.
+        let (s_a, s_b) = keys();
+        let mut w = SimChains::new(s_a, s_b);
+        let (mut maker, init) = Swap::start_maker(T0, T1, s_b);
+        let (mut taker, _) = Swap::start_taker(T0, T1, s_a);
+
+        w.actor = Party::Maker;
+        for a in init {
+            execute(a, &mut w);
+        }
+        w.drive(Party::Maker, &mut maker, Event::SolLocked);
+        w.drive(Party::Taker, &mut taker, Event::SolLocked); // taker locks XMR
+        w.drive(Party::Maker, &mut maker, Event::XmrLocked); // maker set_ready
+        w.drive(Party::Taker, &mut taker, Event::XmrLocked);
+
+        // Taker claims late, inside [t0, t1). The maker hasn't seen it yet.
+        w.now = T1 - 1;
+        w.drive(Party::Taker, &mut taker, Event::Ready); // -> ClaimSol (reveals s_a)
+        assert_eq!(w.sol_to, Some(Party::Taker), "taker took the SOL on-chain");
+        let s_a_rev = w.sol_revealed.expect("claim revealed s_a");
+
+        // The maker, still unaware, hits its own t1 and *attempts* a refund. On-chain that
+        // refund reverts because the escrow is already settled — so the sim must not let it
+        // double-settle. The maker's state machine moves to Settled (refund route) but the
+        // executor's refund call would fail on the real chain; we model that by NOT driving
+        // the refund through the sim (the escrow is already settled). The maker's machine is
+        // now in Settled awaiting a SolRefunded that will never come.
+        let refund_actions = maker.on(Event::Tick { now: T1 });
+        assert_eq!(refund_actions, vec![crate::swap::Action::RefundSol]);
+        assert_eq!(maker.phase(), Phase::Settled);
+
+        // Now the belated SolClaimed finally reaches the maker. Pre-fix this fell through to
+        // `_ => vec![]` and the XMR was lost. Post-fix it re-routes onto the claim path.
+        w.drive(Party::Maker, &mut maker, Event::SolClaimed { s_a: s_a_rev }); // -> sweep XMR
+        assert_eq!(maker.phase(), Phase::Settled, "still sweeping, not Done");
+        w.drive(Party::Maker, &mut maker, Event::XmrSwept); // -> done
+
+        assert_eq!(w.sol_to, Some(Party::Taker), "taker kept the SOL");
+        assert_eq!(w.xmr_swept_by, Some(Party::Maker), "maker recovered the XMR — no loss");
+        assert_eq!(maker.phase(), Phase::Done);
+    }
+
+    #[test]
+    fn sim_claim_and_refund_enforce_the_reveal_check() {
+        // Fidelity guard for bug #5: the sim now checks the revealed scalar against the
+        // committed lock point on both settle paths. If the keys were wired up so that
+        // s_a/s_b don't match the recorded lock points, settling must panic — proving the
+        // check is live (the sim already did this for sweep_xmr).
+        let (s_a, s_b) = keys();
+        let w = SimChains::new(s_a, s_b);
+        assert_eq!(w.lock_point_claim, EdwardsPoint::mul_base(&s_a));
+        assert_eq!(w.lock_point_refund, EdwardsPoint::mul_base(&s_b));
+
+        // A claim with a mismatched stored scalar must trip the reveal assertion.
+        let mut bad = SimChains::new(s_a, s_b);
+        bad.lock_point_claim = EdwardsPoint::mul_base(&Scalar::from(99u64));
+        bad.actor = Party::Taker;
+        bad.now = T0;
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            bad.claim_sol();
+        }))
+        .is_err();
+        assert!(panicked, "claim with a non-matching reveal must be rejected by the sim");
+    }
+
+    #[test]
+    fn full_swap_settles_with_random_key_shares() {
+        // A4 coverage gap: the other sim tests use the tiny constants 11 and 7. Run the happy
+        // path with full-width random scalars so nothing depends on small-scalar accidents.
+        use crate::KeyShare;
+        let alice = KeyShare::generate();
+        let bob = KeyShare::generate();
+        let (s_a, s_b) = (alice.secret, bob.secret);
+
+        let mut w = SimChains::new(s_a, s_b);
+        let (mut maker, init) = Swap::start_maker(T0, T1, s_b);
+        let (mut taker, _) = Swap::start_taker(T0, T1, s_a);
+
+        w.actor = Party::Maker;
+        for a in init {
+            execute(a, &mut w);
+        }
+        w.drive(Party::Maker, &mut maker, Event::SolLocked);
+        w.drive(Party::Taker, &mut taker, Event::SolLocked);
+        w.drive(Party::Maker, &mut maker, Event::XmrLocked);
+        w.drive(Party::Taker, &mut taker, Event::XmrLocked);
+        w.drive(Party::Taker, &mut taker, Event::Ready); // claim (reveals s_a)
+        let s_a_rev = w.sol_revealed.expect("claim revealed s_a");
+        w.drive(Party::Maker, &mut maker, Event::SolClaimed { s_a: s_a_rev });
+        w.drive(Party::Maker, &mut maker, Event::XmrSwept);
+        w.drive(Party::Taker, &mut taker, Event::SolClaimed { s_a: s_a_rev });
+
+        assert_eq!(w.sol_to, Some(Party::Taker), "taker got the SOL");
+        assert_eq!(w.xmr_swept_by, Some(Party::Maker), "maker got the XMR");
+        assert_eq!(maker.phase(), Phase::Done);
+        assert_eq!(taker.phase(), Phase::Done);
     }
 }

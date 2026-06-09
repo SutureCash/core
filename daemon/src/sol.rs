@@ -133,25 +133,42 @@ impl std::fmt::Display for SolError {
 
 impl std::error::Error for SolError {}
 
+/// How long the RPC agent waits to connect, and to receive a full response, before giving
+/// up. Without these a hung or malicious node blocks the daemon thread forever.
+const RPC_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const RPC_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// A minimal blocking JSON-RPC client for a Solana node's HTTP endpoint.
 pub struct Rpc {
     url: String,
     commitment: String,
+    /// A `ureq` agent carrying connect + response timeouts, reused for every call so a
+    /// single stuck request can't wedge the whole swap.
+    agent: ureq::Agent,
 }
 
 impl Rpc {
     /// `url` like `https://api.devnet.solana.com`. Uses "confirmed" commitment.
     pub fn new(url: &str) -> Self {
+        let agent = ureq::Agent::config_builder()
+            .timeout_connect(Some(RPC_CONNECT_TIMEOUT))
+            .timeout_recv_response(Some(RPC_RESPONSE_TIMEOUT))
+            .build()
+            .new_agent();
+
         Self {
             url: url.to_string(),
             commitment: "confirmed".to_string(),
+            agent,
         }
     }
 
     fn call(&self, method: &str, params: Value) -> Result<Value, SolError> {
         let body = json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params });
 
-        let mut resp = ureq::post(&self.url)
+        let mut resp = self
+            .agent
+            .post(&self.url)
             .send_json(&body)
             .map_err(|e| SolError::Transport(e.to_string()))?;
         let value: Value = resp
@@ -239,11 +256,23 @@ impl Rpc {
         }
     }
 
-    /// The raw account data, or `None` if the account doesn't exist.
+    /// The raw account data at this `Rpc`'s default ("confirmed") commitment, or `None` if
+    /// the account doesn't exist.
     pub fn get_account_data(&self, pubkey: &Pubkey) -> Result<Option<Vec<u8>>, SolError> {
+        self.get_account_data_at(pubkey, &self.commitment)
+    }
+
+    /// The raw account data at an explicit `commitment` level (e.g. "finalized" for a
+    /// fund-moving read that must not be undone by a reorg), or `None` if the account
+    /// doesn't exist.
+    pub fn get_account_data_at(
+        &self,
+        pubkey: &Pubkey,
+        commitment: &str,
+    ) -> Result<Option<Vec<u8>>, SolError> {
         let r = self.call(
             "getAccountInfo",
-            json!([pubkey.to_string(), { "encoding": "base64", "commitment": self.commitment }]),
+            json!([pubkey.to_string(), { "encoding": "base64", "commitment": commitment }]),
         )?;
 
         let value = &r["value"];
@@ -272,7 +301,7 @@ impl Rpc {
     }
 }
 
-/// Build the instruction data for a settle (claim/refund) reveal.
+/// Build the `Lock` instruction: funds the escrow PDA and pins the swap terms on-chain.
 pub fn lock_ix(program_id: &Pubkey, escrow: &Pubkey, terms: &SwapTerms) -> Instruction {
     Instruction::new_with_borsh(
         *program_id,
@@ -432,7 +461,20 @@ impl RpcSol {
     }
 
     pub fn read_escrow(&self) -> Result<Option<Escrow>, SolError> {
-        match self.rpc.get_account_data(&self.escrow)? {
+        Self::decode_escrow(self.rpc.get_account_data(&self.escrow)?)
+    }
+
+    /// Read the escrow at "finalized" commitment. Settlement is fund-moving and acted on
+    /// once (the daemon sweeps XMR against the revealed scalar), so it must be read at a
+    /// commitment a reorg can't undo — a settle observed only at "confirmed" could be
+    /// orphaned and replaced by the opposite outcome. The tradeoff is latency: finalization
+    /// lags "confirmed" by a handful of slots, so the sweep starts a little later.
+    pub fn read_escrow_finalized(&self) -> Result<Option<Escrow>, SolError> {
+        Self::decode_escrow(self.rpc.get_account_data_at(&self.escrow, "finalized")?)
+    }
+
+    fn decode_escrow(data: Option<Vec<u8>>) -> Result<Option<Escrow>, SolError> {
+        match data {
             None => Ok(None),
             Some(data) => {
                 if data.len() != Escrow::LEN {
@@ -442,7 +484,7 @@ impl RpcSol {
                         Escrow::LEN
                     )));
                 }
-                
+
                 Escrow::try_from_slice(&data)
                     .map(Some)
                     .map_err(|e| SolError::Decode(e.to_string()))

@@ -32,7 +32,7 @@ pub struct FunderWallet {
     pub password: String,
 }
 
-#[derive(PartialEq, Eq, Clone, Copy)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 enum WalletKind {
     None,
     Funder,
@@ -58,6 +58,10 @@ pub struct XmrChain {
     payout: Address,
     /// The taker carries a funder wallet to lock from; the maker doesn't lock, so `None`.
     funder: Option<FunderWallet>,
+    /// Password for the watch/sweep wallet files this swap creates on the wallet-rpc's disk.
+    /// The sweep wallet holds the full 2-of-2 spend key, so a blank password would let anyone
+    /// with read access to that directory open it and sweep — the caller must supply a real one.
+    wallet_password: String,
     /// Single-use wallet filenames for this swap (never reuse a shared wallet).
     watch_file: String,
     sweep_file: String,
@@ -77,6 +81,7 @@ impl XmrChain {
         amount: u64,
         payout: Address,
         funder: Option<FunderWallet>,
+        wallet_password: &str,
         tag: &str,
     ) -> Self {
         Self {
@@ -87,6 +92,7 @@ impl XmrChain {
             amount,
             payout,
             funder,
+            wallet_password: wallet_password.to_string(),
             watch_file: format!("suture-watch-{tag}"),
             sweep_file: format!("suture-sweep-{tag}"),
             open: WalletKind::None,
@@ -95,10 +101,24 @@ impl XmrChain {
         }
     }
 
-    fn close_open(&mut self) {
-        if self.open != WalletKind::None {
-            let _ = self.rpc.close_wallet();
-            self.open = WalletKind::None;
+    /// Close whatever wallet is open. `monero-wallet-rpc` serves one wallet at a time, so a
+    /// failed close that we then *believed* succeeded would leave `self.open` pointing at the
+    /// wrong wallet — and a later sweep could drain the wrong file. So only clear `open` if
+    /// the close actually succeeded; surface the error otherwise.
+    fn close_open(&mut self) -> Result<(), WalletError> {
+        if self.open == WalletKind::None {
+            return Ok(());
+        }
+
+        match self.rpc.close_wallet() {
+            Ok(_) => {
+                self.open = WalletKind::None;
+                Ok(())
+            }
+            Err(e) => Err(WalletError::Transport(format!(
+                "failed to close the {:?} wallet (open state now unknown): {e}",
+                self.open
+            ))),
         }
     }
 
@@ -107,11 +127,11 @@ impl XmrChain {
             return Ok(());
         }
 
-        self.close_open();
+        self.close_open()?;
         if self.created_watch {
             self.rpc.call(
                 "open_wallet",
-                json!({ "filename": self.watch_file, "password": "" }),
+                json!({ "filename": self.watch_file, "password": self.wallet_password }),
             )?;
         } else {
             self.rpc.open_watch_wallet(
@@ -119,6 +139,7 @@ impl XmrChain {
                 &self.lock_addr,
                 &self.view_secret,
                 self.restore_height,
+                &self.wallet_password,
             )?;
             self.created_watch = true;
         }
@@ -135,7 +156,7 @@ impl XmrChain {
             .clone()
             .ok_or_else(|| WalletError::Transport("no funder wallet configured to lock from".into()))?;
 
-        self.close_open();
+        self.close_open()?;
         self.rpc.call(
             "open_wallet",
             json!({ "filename": funder.filename, "password": funder.password }),
@@ -144,22 +165,28 @@ impl XmrChain {
         self.rpc.refresh()?;
 
         let res = self.rpc.lock(&self.lock_addr, self.amount)?;
-        self.close_open();
+        self.close_open()?;
 
         Ok(res["tx_hash"].as_str().unwrap_or_default().to_string())
     }
 
-    /// True once the locked output is visible in the 2-of-2 (total balance ≥ amount).
-    /// Confirmations/unlock are waited on later, at sweep time.
+    /// True once the locked output is *confirmed and spendable* in the 2-of-2
+    /// (`unlocked_balance ≥ amount`), not merely seen at 0-conf (`balance`). The maker arms
+    /// `set_ready` — an irreversible commitment that opens the taker's claim window — off
+    /// this signal, so it must reflect real confirmed XMR: a 0-conf or reorg-dropped output
+    /// must not count, or the maker could open the claim window against XMR that never lands.
     pub fn locked(&mut self) -> Result<bool, WalletError> {
         self.ensure_watch()?;
 
-        self.rpc.refresh().ok();
+        // A failed refresh means the balance below is stale; don't silently trust it.
+        if let Err(e) = self.rpc.refresh() {
+            eprintln!("xmr locked(): refresh failed, balance may be stale: {e}");
+        }
 
         let b = self.rpc.balance()?;
-        let total = b["balance"].as_u64().unwrap_or(0);
+        let unlocked = b["unlocked_balance"].as_u64().unwrap_or(0);
 
-        Ok(total >= self.amount)
+        Ok(unlocked >= self.amount)
     }
 
     /// Sweep: rebuild the full wallet from `s_a + s_b`, wait for the output to unlock, and
@@ -169,33 +196,56 @@ impl XmrChain {
             .map_err(|e| WalletError::Transport(format!("reconstructed spend key invalid: {e}")))?;
         let keys = sweep_keypair(spend, self.view_secret);
 
-        self.close_open();
+        self.close_open()?;
         if self.created_sweep {
             self.rpc.call(
                 "open_wallet",
-                json!({ "filename": self.sweep_file, "password": "" }),
+                json!({ "filename": self.sweep_file, "password": self.wallet_password }),
             )?;
         } else {
-            self.rpc
-                .open_sweep_wallet(&self.sweep_file, &self.lock_addr, &keys, self.restore_height)?;
+            self.rpc.open_sweep_wallet(
+                &self.sweep_file,
+                &self.lock_addr,
+                &keys,
+                self.restore_height,
+                &self.wallet_password,
+            )?;
             self.created_sweep = true;
         }
         self.open = WalletKind::Sweep;
 
         // Wait for the output to unlock; sweep_all fails if nothing is spendable yet.
+        let mut unlocked = false;
         for _ in 0..UNLOCK_TRIES {
-            self.rpc.refresh().ok();
+            // A stale balance read here would burn the whole wait on bad data, so surface
+            // refresh failures rather than swallowing them.
+            if let Err(e) = self.rpc.refresh() {
+                eprintln!("xmr sweep(): refresh failed during unlock wait, balance may be stale: {e}");
+            }
 
             let b = self.rpc.balance()?;
             if b["unlocked_balance"].as_u64().unwrap_or(0) >= self.amount {
+                unlocked = true;
                 break;
             }
 
             sleep(UNLOCK_POLL);
         }
 
+        // If we timed out without the output unlocking, do NOT sweep blindly — sweep_all on
+        // nothing-spendable just errors, and worse a partial state could move the wrong
+        // funds. Bail with the wallet filename so the operator can open it and sweep by hand;
+        // the funds are sitting in this wallet file, recoverable.
+        if !unlocked {
+            return Err(WalletError::Transport(format!(
+                "sweep timed out waiting for the 2-of-2 output to unlock after {} tries; \
+                 the XMR is in wallet file '{}' — open it and sweep manually",
+                UNLOCK_TRIES, self.sweep_file
+            )));
+        }
+
         let swept = self.rpc.sweep_all(&self.payout)?;
-        self.close_open();
+        self.close_open()?;
 
         let txs = swept["tx_hash_list"]
             .as_array()

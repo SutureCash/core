@@ -25,8 +25,10 @@
 //!
 //! Account-identity safety: the escrow is a PDA, and every instruction re-derives
 //! that PDA and checks the account is owned by this program before trusting its
-//! contents (see `load`). The committed points are validated at `lock` so a
-//! malicious counterparty can't brick a swap with a garbage or identity point.
+//! contents (see `load`). The committed points are validated at `lock` (on-curve,
+//! canonical encoding, non-identity), but prime-order subgroup membership is NOT
+//! checked on-chain — a torsion point can only brick its own swap, and the real
+//! guard is the taker's off-chain `claim_point == s_a·G` check before it locks XMR.
 
 use borsh::{BorshDeserialize, BorshSerialize};
 use solana_curve25519::{
@@ -61,6 +63,23 @@ const ED25519_IDENTITY: [u8; 32] = {
     id[0] = 1;
     id
 };
+
+/// Order of the Ed25519 prime-order subgroup, L = 2^252 + 27742317777372353535851937790883648493,
+/// as 32 little-endian bytes. A canonical scalar (what every honest Monero key half is) is
+/// strictly less than this. We compare reveals against it ourselves rather than trusting the
+/// curve syscall to reject out-of-range scalars — see `is_canonical_scalar`.
+const ED25519_ORDER: [u8; 32] = [
+    0xed, 0xd3, 0xf5, 0x5c, 0x1a, 0x63, 0x12, 0x58, 0xd6, 0x9c, 0xf7, 0xa2, 0xde, 0xf9, 0xde, 0x14,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10,
+];
+
+/// The Ed25519 field prime p = 2^255 - 19, as 32 little-endian bytes. A compressed point
+/// encodes its y-coordinate in the low 255 bits (the top bit is the x sign), and a canonical
+/// encoding requires that y < p. We use this to reject non-canonical point encodings at lock.
+const ED25519_FIELD_PRIME: [u8; 32] = [
+    0xed, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f,
+];
 
 const ESCROW_SEED: &[u8] = b"escrow";
 
@@ -211,13 +230,22 @@ fn lock(
         return Err(EscrowError::BadWindows.into());
     }
 
-    // The committed points must be real, non-identity curve points. A garbage point
-    // can never be matched by any reveal (bricking the swap), and the identity point
-    // has the trivial discrete log 0 — both let a malicious locker grief or fake a
-    // settlement. The reveal check itself multiplies the basepoint, never the stored
-    // point, so this is the only place the commitment is vetted.
+    // The committed points must decompress to a real curve point (validate_edwards), use a
+    // canonical encoding (y < p, no non-canonical aliases), and not be the identity (trivial
+    // discrete log 0). The reveal check multiplies the basepoint, never the stored point, so
+    // this is the only place the commitment is vetted.
+    //
+    // Honesty about what this does NOT do: validate_edwards does not enforce prime-order
+    // subgroup membership, and there is no on-chain syscall to do so cheaply, so a torsion
+    // or otherwise non-prime-order point still passes here. That is acceptable because such
+    // a point can only brick its own swap — no scalar `s` exists with `s·G` equal to it, so
+    // the matching reveal can never settle (a griefing/self-DoS, never theft of anyone's
+    // funds). The real backstop is off-chain: the taker verifies `claim_point == s_a·G`
+    // before locking XMR, which rejects any committed point that isn't a usable key half.
     if !validate_edwards(&PodEdwardsPoint(claim_point))
         || !validate_edwards(&PodEdwardsPoint(refund_point))
+        || !is_canonical_point(&claim_point)
+        || !is_canonical_point(&refund_point)
         || claim_point == ED25519_IDENTITY
         || refund_point == ED25519_IDENTITY
     {
@@ -247,11 +275,17 @@ fn lock(
         return Err(EscrowError::BadAccount.into());
     }
 
-    // The locked amount has to clear the rent floor on its own, so the claimer's
-    // payout can land in a fresh account. This blocks dust escrows that would be
-    // unclaimable (and thus a griefing vector against a counterparty's locked XMR).
+    // The claimer's *post-fee* payout has to clear the rent floor, so it can land in a fresh
+    // account without the runtime rejecting the credit. Checking the gross `amount` isn't
+    // enough: with a small amount and the 3% cap, `amount - fee` could dip below the floor
+    // and the in-window claim would revert, pushing the taker past t1 and out of its window.
+    // We use the worst-case fee (MAX_FEE_BPS), so the floor holds for any fee the lock sets.
     let rent = Rent::get()?;
-    if amount < rent.minimum_balance(0) {
+    let worst_case_fee = (amount as u128 * MAX_FEE_BPS as u128 / 10_000u128) as u64;
+    let min_payout = amount
+        .checked_sub(worst_case_fee)
+        .ok_or(ProgramError::ArithmeticOverflow)?;
+    if min_payout < rent.minimum_balance(0) {
         return Err(EscrowError::AmountTooSmall.into());
     }
 
@@ -338,7 +372,9 @@ fn claim(program_id: &Pubkey, accounts: &[AccountInfo], reveal: [u8; 32]) -> Pro
     if !(open && t < escrow.t1) {
         return Err(EscrowError::NotInClaimWindow.into());
     }
-    if !reveal_matches(&reveal, &escrow.claim_point) {
+    // Reject non-canonical scalars before the curve op: the syscall would reduce them mod L
+    // and let a malleable alias (s, s + L, ...) settle, storing an unusable Monero key half.
+    if !is_canonical_scalar(&reveal) || !reveal_matches(&reveal, &escrow.claim_point) {
         return Err(EscrowError::BadSecret.into());
     }
     if claimer.key.to_bytes() != escrow.claimer
@@ -394,7 +430,8 @@ fn refund(program_id: &Pubkey, accounts: &[AccountInfo], reveal: [u8; 32]) -> Pr
     if !(early || late) {
         return Err(EscrowError::NotInRefundWindow.into());
     }
-    if !reveal_matches(&reveal, &escrow.refund_point) {
+    // Same canonical-scalar gate as claim: keep a malleable alias of s_b out of `revealed`.
+    if !is_canonical_scalar(&reveal) || !reveal_matches(&reveal, &escrow.refund_point) {
         return Err(EscrowError::BadSecret.into());
     }
     if locker.key.to_bytes() != escrow.locker {
@@ -436,10 +473,50 @@ fn close(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     Ok(())
 }
 
+/// Little-endian `< rhs`? Used to test a 32-byte value against a constant bound.
+/// We walk from the most-significant byte down and stop at the first difference.
+fn lt_le(value: &[u8; 32], rhs: &[u8; 32]) -> bool {
+    for i in (0..32).rev() {
+        if value[i] != rhs[i] {
+            return value[i] < rhs[i];
+        }
+    }
+
+    // Exactly equal is not strictly less.
+    false
+}
+
+/// Is `reveal` a canonical Ed25519 scalar, i.e. strictly less than the group order L?
+///
+/// This matters because the on-chain curve25519 MUL syscall silently *reduces* its scalar
+/// argument mod L instead of rejecting an out-of-range encoding the way off-chain
+/// curve25519-dalek does. Without this check, both `s` and `s + L` would multiply to the
+/// same point and settle, and whichever encoding got stored in `escrow.revealed` might be
+/// non-canonical — and a non-canonical scalar is unusable as a Monero key half, which would
+/// quietly break cross-chain atomicity. Honest clients always reveal `s < L`, so this never
+/// touches the happy path; it only rejects the malleable aliases.
+fn is_canonical_scalar(reveal: &[u8; 32]) -> bool {
+    lt_le(reveal, &ED25519_ORDER)
+}
+
+/// Is `point` a canonically-encoded compressed Ed25519 point? The low 255 bits are the
+/// y-coordinate and the top bit is the x sign; a canonical encoding requires y < p. We mask
+/// off the sign bit (a set sign bit on a small y is perfectly legal) and compare y against
+/// the field prime. This is cheap and rejects the non-canonical y >= p encodings; it does
+/// NOT prove prime-order subgroup membership (see the note at `lock`).
+fn is_canonical_point(point: &[u8; 32]) -> bool {
+    let mut y = *point;
+    y[31] &= 0x7f; // drop the x-sign bit; what remains is the y-coordinate
+
+    lt_le(&y, &ED25519_FIELD_PRIME)
+}
+
 /// The check the whole thing rests on: does `reveal · G` land on the committed
 /// point? On-chain this is the curve25519 syscall; off-chain (tests) it's
-/// curve25519-dalek. A non-canonical scalar makes the syscall return None, which
-/// we treat as a failed reveal.
+/// curve25519-dalek. The caller must have already rejected non-canonical scalars
+/// (see `is_canonical_scalar`) — the on-chain syscall would otherwise reduce them mod L
+/// and accept malleable aliases. A scalar the syscall still can't handle yields None,
+/// which we treat as a failed reveal.
 fn reveal_matches(reveal: &[u8; 32], point: &[u8; 32]) -> bool {
     match multiply_edwards(&PodScalar(*reveal), &ED25519_BASEPOINT) {
         Some(p) => &p.0 == point,
@@ -454,6 +531,13 @@ fn now() -> Result<i64, ProgramError> {
 /// Move lamports between two program-visible accounts. The escrow PDA is owned by
 /// this program, so its balance can be debited directly without a CPI.
 fn move_lamports(from: &AccountInfo, to: &AccountInfo, amount: u64) -> ProgramResult {
+    // Defensive: a same-account transfer would borrow the same lamports cell twice and, if
+    // this ever read a cached balance, could double-count. Callers already block paying the
+    // escrow into itself; this keeps the helper safe no matter who calls it later.
+    if from.key == to.key {
+        return Err(EscrowError::BadAccount.into());
+    }
+
     **from.try_borrow_mut_lamports()? = from
         .lamports()
         .checked_sub(amount)

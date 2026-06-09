@@ -119,6 +119,30 @@ export function pointFromScalar(scalar: bigint): Uint8Array {
   return Point.BASE.multiply(mod(scalar, L) || 1n).toBytes();
 }
 
+/**
+ * A non-canonical 32-byte encoding of the scalar `s`: `s + L`. It reduces back to `s` mod L,
+ * so the on-chain curve syscall would multiply it to the same point as `s` — which is exactly
+ * the malleability the program now rejects up front. Used to test that `s + L` is refused even
+ * though it "matches" the committed point. (Since `s < L ≈ 2^252` and `L ≈ 2^252`, `s + L`
+ * comfortably fits in 32 bytes.)
+ */
+export function nonCanonicalReveal(scalar: bigint): Uint8Array {
+  return bigToLe(mod(scalar, L) + L, 32);
+}
+
+/**
+ * A non-canonical *point* encoding: the y-coordinate of a real on-curve point re-encoded as
+ * `y + p` (the field prime). curve25519-dalek decompresses it to the same point (it reduces y
+ * mod p and ignores the high bit), so it passes the on-curve check — but the program's
+ * canonical-encoding check rejects it because the raw y is `>= p`. We use a point with a small
+ * y (here `y = 3`, a valid Ed25519 point) so `y + p` stays below 2^255 and the sign bit is 0.
+ */
+export function nonCanonicalPoint(): Uint8Array {
+  const p = Point.Fp.ORDER; // 2^255 - 19
+  const y = 3n; // a small, valid y-coordinate on Ed25519
+  return bigToLe(y + p, 32);
+}
+
 export function randomId(): Uint8Array {
   return new Uint8Array(randomBytes(32));
 }

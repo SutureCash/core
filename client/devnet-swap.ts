@@ -44,7 +44,10 @@ const RPC_URL = process.env.RPC_URL ?? "https://api.devnet.solana.com";
 const PAYER_PATH =
   process.env.PAYER ?? join(homedir(), ".config", "solana", "id.json");
 
-const ESCROW_SIZE = 253; // bytes; must match Escrow::LEN in the program
+// Account size, in bytes. This MUST equal `Escrow::LEN` in the program (programs/
+// sol-escrow/src/lib.rs); the rent quote below and `decodeEscrow` both depend on it. If the
+// struct ever grows, this constant has to move with it — the post-lock assertion guards that.
+const ESCROW_SIZE = 253;
 const AMOUNT = 0.05 * LAMPORTS_PER_SOL;
 const FEE_BPS = 300; // 3%
 const FEE = Math.floor((AMOUNT * FEE_BPS) / 10_000);
@@ -118,6 +121,16 @@ async function main() {
   );
   console.log("lock      :", lockSig);
   const afterLock = await snapshot("after lock");
+
+  // The on-chain account must be exactly the size we assumed for the rent quote and decoding.
+  // If this trips, ESCROW_SIZE has drifted from the program's Escrow::LEN and must be fixed.
+  const lockedAccount = await conn.getAccountInfo(escrow);
+  assert.ok(lockedAccount, "escrow account should exist after lock");
+  assert.equal(
+    lockedAccount!.data.length,
+    ESCROW_SIZE,
+    `escrow account size ${lockedAccount!.data.length} != ESCROW_SIZE ${ESCROW_SIZE} (Escrow::LEN drift)`,
+  );
 
   const readySig = await sendAndConfirmTransaction(
     conn,
