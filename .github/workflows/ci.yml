@@ -33,21 +33,23 @@ jobs:
   program:
     name: program (build-sbf) + bankrun
     runs-on: ubuntu-latest
+    env:
+      AGAVE_VERSION: "4.0.1"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
 
       # `cargo build-sbf` and its platform-tools ship with the Agave CLI. Pinning a specific
       # version keeps the BPF build reproducible; bump AGAVE_VERSION intentionally —
-      # see https://github.com/anza-xyz/agave/releases
+      # see https://github.com/anza-xyz/agave/releases. Must be new enough that its bundled
+      # Rust supports the dependency tree's edition (4.0.1 bundles rustc 1.89; the older
+      # 2.2.x line bundles 1.84, which can't parse edition2024 crates like crypto-common).
       - name: Cache Solana platform-tools
         uses: actions/cache@v4
         with:
           path: ~/.cache/solana
-          key: solana-platform-tools-${{ runner.os }}
+          key: solana-platform-tools-${{ runner.os }}-${{ env.AGAVE_VERSION }}
       - name: Install the Solana (Agave) CLI
-        env:
-          AGAVE_VERSION: "2.2.15"
         run: |
           sh -c "$(curl -sSfL https://release.anza.xyz/v${AGAVE_VERSION}/install)"
           echo "$HOME/.local/share/solana/install/active_release/bin" >> "$GITHUB_PATH"
